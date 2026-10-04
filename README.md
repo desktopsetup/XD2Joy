@@ -172,7 +172,7 @@ example
 
 ```sh
 west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_left "C:\Users\Desktopsetup\Desktop\XD2Joy\firmware" --pristine
--- west build: making build dir C:\Users\straw\desktop\MALOFwo\zephyrproject\zephyr\build\xd2joy_left pristine
+-- west build: making build dir C:\Users\Desktopsetup\desktop\MALOFwo\zephyrproject\zephyr\build\xd2joy_left pristine
 -- west build: generating a build system
 Loading Zephyr default modules (Zephyr base).
 ```
