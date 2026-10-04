@@ -2,7 +2,7 @@
 
 This firmware makes 2 nRF52840 chips appear to a Switch 2 as a left and right Joy-Con.
 The left side is the Bluetooth keyboard, the right as the Bluetooth mouse. The inputs can link with each other making it possible to have the Keyboard (left Joy-Con) send (right Joy-Con) input like A, B, X, Y, etc. making up for the little amount of inputs on most mice. It runs on a pair of Pro Micro nRF52840 boards and everything is set up in the browser with
-the [XD2Joy Web tool](https://github.com/desktopsetup/XD2Joy-Webtool) making it more customizable. The **XD2Joy dongle** will be a
+the [XD2Joy Web tool](https://desktopsetup.github.io/XD2Joy-Webtool/) making it more customizable. The **XD2Joy dongle** will be a
 consumer friendly version that is in development and is ran on this same firmware.
 
 ## Contents
