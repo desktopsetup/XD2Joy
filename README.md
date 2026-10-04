@@ -43,7 +43,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 ## Bugs
 
-- **Bluetooth Classic:** Bluetooth Classic devices are not compatible and is a bug that can not be fixed. 
+- **Bluetooth Classic:** Bluetooth Classic/Bluetooth 3.0 devices are not compatible and is a bug that can not be fixed since it is not Bluetooth Low Energy (BLE). 
 - **Connecting:** Sometimes when you do a fresh disconnect or new pair to the console only 1 of the Bluetooth devices pair and it takes backing out a couple times for it to recognize the other one.
 - **Snapping on slow mouse movement:** slow movements can snap visually, in both Mouse Mode and Thumbstick Mode. The Thumbstick Mode has a setting in the Web-Tool that helps.
 - **Misread inputs in games:** Certain conditions from the keyboard/mouse or the game receives inputs that never are actually sent to the console but show up in game and not outside of it.
