@@ -1,0 +1,14 @@
+diff --git a/include/zephyr/bluetooth/hci_types.h b/include/zephyr/bluetooth/hci_types.h
+index 4fea461a35c..663fd865d18 100644
+--- a/include/zephyr/bluetooth/hci_types.h
++++ b/include/zephyr/bluetooth/hci_types.h
+@@ -3585,7 +3585,8 @@ struct bt_hci_evt_le_advertising_report {
+ } __packed;
+ 
+ /** All limits according to BT Core Spec v5.4 [Vol 4, Part E]. */
+-#define BT_HCI_LE_INTERVAL_MIN            0x0006
++/* XD2Joy 5 ms interval patch (see ZEPHYR_PATCHES.md, patch 1). */
++#define BT_HCI_LE_INTERVAL_MIN            0x0004
+ #define BT_HCI_LE_INTERVAL_MAX            0x0c80
+ #define BT_HCI_LE_PERIPHERAL_LATENCY_MIN (0x0000U)
+ #define BT_HCI_LE_PERIPHERAL_LATENCY_MAX  0x01f3

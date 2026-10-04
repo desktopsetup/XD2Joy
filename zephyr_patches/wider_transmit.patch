@@ -1,0 +1,53 @@
+diff --git a/subsys/bluetooth/controller/ll_sw/nordic/lll/lll_scan.c b/subsys/bluetooth/controller/ll_sw/nordic/lll/lll_scan.c
+index 43658975972..c291013e6d1 100644
+--- a/subsys/bluetooth/controller/ll_sw/nordic/lll/lll_scan.c
++++ b/subsys/bluetooth/controller/ll_sw/nordic/lll/lll_scan.c
+@@ -284,8 +284,22 @@ void lll_scan_prepare_connect_req(struct lll_scan *lll, struct pdu_adv *pdu_tx,
+ 
+ 	if (!IS_ENABLED(CONFIG_BT_CTLR_SCHED_ADVANCED) ||
+ 	    lll->conn_win_offset_us == 0U) {
++#if defined(JC_CONN_WIN_OFFSET) && defined(JC_CONN_WIN_SIZE)
++		/* XD2Joy conn window patch (see ZEPHYR_PATCHES.md, patch 2). */
++		uint16_t jc_off = (uint16_t)JC_CONN_WIN_OFFSET;
++		uint16_t jc_size = (uint16_t)JC_CONN_WIN_SIZE;
++
++		if (lll_conn->interval > 1U) {
++			jc_off = MIN(jc_off, lll_conn->interval - 1U);
++			jc_size = MIN(jc_size, lll_conn->interval - 1U);
++		}
++		*conn_space_us = conn_offset_us + ((uint32_t)jc_off * CONN_INT_UNIT_US);
++		pdu_tx->connect_ind.win_offset = sys_cpu_to_le16(jc_off);
++		pdu_tx->connect_ind.win_size = (uint8_t)jc_size;
++#else
+ 		*conn_space_us = conn_offset_us;
+ 		pdu_tx->connect_ind.win_offset = sys_cpu_to_le16(0);
++#endif
+ 	} else {
+ 		uint32_t win_offset_us = radio_tmr_start_latency_get() +
+ 			lll->conn_win_offset_us +
+diff --git a/subsys/bluetooth/controller/ll_sw/ull_llcp_conn_upd.c b/subsys/bluetooth/controller/ll_sw/ull_llcp_conn_upd.c
+index f5c0e0b22a3..3fc51cb6e0d 100644
+--- a/subsys/bluetooth/controller/ll_sw/ull_llcp_conn_upd.c
++++ b/subsys/bluetooth/controller/ll_sw/ull_llcp_conn_upd.c
+@@ -241,6 +241,21 @@ static void cu_prepare_update_ind(struct ll_conn *conn, struct proc_ctx *ctx)
+ #endif /* !CONFIG_BT_CTLR_SCHED_ADVANCED */
+ #endif /* CONFIG_BT_CTLR_CONN_PARAM_REQ */
+ 
++#if defined(JC_CONN_WIN_OFFSET) && defined(JC_CONN_WIN_SIZE)
++	/* XD2Joy conn window patch (see ZEPHYR_PATCHES.md, patch 2). */
++	{
++		uint16_t jc_off = (uint16_t)JC_CONN_WIN_OFFSET;
++		uint16_t jc_size = (uint16_t)JC_CONN_WIN_SIZE;
++
++		if (ctx->data.cu.interval_max > 1U) {
++			jc_off = MIN(jc_off, ctx->data.cu.interval_max - 1U);
++			jc_size = MIN(jc_size, ctx->data.cu.interval_max - 1U);
++		}
++		ctx->data.cu.win_size = (uint8_t)jc_size;
++		ctx->data.cu.win_offset_us = (uint32_t)jc_off * CONN_INT_UNIT_US;
++	}
++#endif
++
+ 	ctx->data.cu.instant = ull_conn_event_counter(conn) + conn->lll.latency +
+ 			       CONN_UPDATE_INSTANT_DELTA;
+ }
