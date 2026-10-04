@@ -209,4 +209,4 @@ The firmware is free software under the GNU General Public License. You can use 
 Only the firmwares own code is under that license. The patches in `zephyr_patches/` change
 Zephyr itself keep Zephyrs Apache 2.0 license
 
-`XData_right.h` and `XData_left.h` is real data captured from Joy-Con 2 controller its included so the firmware can talk to the console.
+`XData_right.h` and `XData_left.h` is real data captured from a Joy-Con 2 controller its included so the firmware can talk to the console.
