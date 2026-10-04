@@ -187,7 +187,7 @@ Do one board at a time both show up as a drive named NICENANO. So try and keep t
 
 ### Using it in the web tool
 
-Open [XD2Joy-WebTool](https://github.com/desktopsetup/XD2Joy-Webtool/tree/main) in Chrome on a computer make sure both boards are still connected to the PC. press **Connect** and
+Open [XD2Joy-WebTool](https://desktopsetup.github.io/XD2Joy-Webtool/) in Chrome on a computer make sure both boards are still connected to the PC. press **Connect** and
 both boards should load in for managing buttons, profiles, selecting the BT keyboard and mouse devices and switch modes all that. The Web-Tool talks to
 the boards over USB so you can pair the devices in the webtool and the console as well so you can see live in the Web-Tool what is working and being sent and configure it live for the console.
 
