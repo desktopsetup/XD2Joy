@@ -28,7 +28,7 @@ mkdir -p "$HERE/out"
 failed=0
 for SIDE in RIGHT LEFT; do
   B="$DIR"
-  ARGS=()
+  ARGS=(-DJC_OUT=OFF)
   if [ "$SIDE" = LEFT ]; then B="${DIR}L"; ARGS+=(-DJC_LEFT=1); fi
   OUT="$ZP/$B/zephyr"
   echo "=== $SIDE  ($ZP/$B)"
