@@ -12,6 +12,20 @@ if(NOT JC_LEFT)
 endif()
 list(APPEND EXTRA_CONF_FILE "${CMAKE_CURRENT_LIST_DIR}/tx_power.conf")
 
+if(NOT DEFINED JC_OUT)
+  set(JC_OUT "${CMAKE_CURRENT_LIST_DIR}/out")
+endif()
+if(JC_OUT)
+  if(JC_LEFT)
+    set(jc_uf2 "${JC_OUT}/xd2joy_LEFT.uf2")
+  else()
+    set(jc_uf2 "${JC_OUT}/xd2joy_RIGHT.uf2")
+  endif()
+  set_property(GLOBAL APPEND PROPERTY extra_post_build_commands
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/zephyr/zephyr.uf2 ${jc_uf2}
+    COMMAND ${CMAKE_COMMAND} -E echo Firmware copied to ${jc_uf2})
+endif()
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(xd2joy)
 
