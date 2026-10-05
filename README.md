@@ -158,27 +158,18 @@ If it worked it should be in `firmware/out/` :
 | `xd2joy_LEFT.uf2` | the left board (keyboard) |
 | `xd2joy_RIGHT.uf2` | the right board (mouse) |
 
-building just 1 side of the firmware inside the Zephyr workspace:
+building just 1 side of the firmware 
 
 ```sh
-west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_left "/path/to/this/repo/firmware" --pristine -- -DJC_LEFT=1
-west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_right "/path/to/this/repo/firmware" --pristine
+cd zephyrproject
+west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_left ../firmware --pristine -- -DJC_LEFT=1
+west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_right ../firmware --pristine
 ```
+
+This should work if you're inside `zephyrproject`
 
 `-DJC_LEFT=1` builds the left half (keyboard) leave it out for the right half (mouse). The
-image to flash is `build/<name>/zephyr/zephyr.uf2`. Use `--pristine`, or a new `-d` folder,
-whenever you change options or apply patches.
-
-it will be mixed in the files in `\zephyrproject\build_xd2joyL\zephyr\zephyr.uf2`
-
-example 
-
-```sh
-west build -b promicro_nrf52840/nrf52840/uf2 -d build/xd2joy_left "C:\Users\Desktopsetup\Desktop\XD2Joy\firmware" --pristine
--- west build: making build dir C:\Users\Desktopsetup\desktop\MALOFwo\zephyrproject\zephyr\build\xd2joy_left pristine
--- west build: generating a build system
-Loading Zephyr default modules (Zephyr base).
-```
+image to flash is copied to `firmware/out/` 
 
 ## Flashing the firmware
 
