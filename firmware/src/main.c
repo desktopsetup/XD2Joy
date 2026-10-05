@@ -1,4 +1,4 @@
-﻿#include <zephyr/kernel.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/init.h>
@@ -1604,11 +1604,20 @@ static struct bt_uuid_16 disc_uuid;
 static uint16_t hid_svc_start, hid_svc_end;
 enum { DISC_PRIMARY, DISC_PROTO, DISC_REPORT, DISC_BATT };
 static uint8_t stage;
+static bool hid_disc_started;
 
 static uint8_t batt_pct = 100;
 static bool batt_known;
 static uint16_t batt_handle;
 static bool batt_read_busy;
+
+static void batt_forget(void)
+{
+	batt_known = false;
+	batt_pct = 100;
+	batt_handle = 0;
+	batt_read_busy = false;
+}
 
 static uint8_t batt_now(void)
 {
@@ -1651,7 +1660,7 @@ static struct bt_gatt_subscribe_params batt_sub;
 static struct bt_gatt_discover_params batt_disc;
 static struct bt_gatt_read_params rd_params;
 static struct bt_gatt_read_params batt_rd;
-#define MAX_RPT 6
+#define MAX_RPT 8
 static struct bt_gatt_subscribe_params sub_params[MAX_RPT];
 static struct bt_gatt_discover_params sub_disc[MAX_RPT];
 static uint8_t sub_count;
@@ -1724,11 +1733,53 @@ static bool console_known;
 
 static uint8_t console_host[6];
 static bool console_bonded;
+static struct bt_conn *conn_refused;
 
 static int64_t pairable_until;
 #define PAIRABLE_MS 120000
 static bool asked_slower;
 static bool hid_params_asked;
+static int64_t hid_usable_at;
+#define HID_PARAM_DELAY_MS 2000
+
+static void hid_params_request(void)
+{
+	static const struct bt_le_conn_param fast = {
+		.interval_min = 9,
+		.interval_max = 12,
+		.latency = 0,
+		.timeout = 400,
+	};
+	struct bt_conn_info info;
+	struct bt_conn *c;
+
+	k_sched_lock();
+	c = g_mouse ? bt_conn_ref(g_mouse) : NULL;
+	k_sched_unlock();
+	if (!c) {
+		return;
+	}
+	if (!bt_conn_get_info(c, &info) && info.type == BT_CONN_TYPE_LE &&
+	    !info.le.latency && info.le.interval_us <= fast.interval_max * 1250U) {
+		bt_conn_unref(c);
+		hid_params_asked = true;
+		return;
+	}
+	bt_conn_le_param_update(c, &fast);
+	bt_conn_unref(c);
+
+	hid_params_asked = true;
+}
+
+static void hid_param_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (hid_usable_at && !hid_params_asked) {
+		hid_params_request();
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(hid_param_work, hid_param_work_fn);
+
 static bool user_active;
 
 static struct bt_conn *g_conn;
@@ -2098,6 +2149,8 @@ static enum adv_mode adv_mode_wanted(void)
 	return user_active ? ADV_BONDED : ADV_OFF;
 }
 
+static void scan_pace_check(void);
+
 #define ADV_WAKE_INT 0x0020
 
 static void adv_start(void)
@@ -2111,6 +2164,7 @@ static void adv_start(void)
 		pairable_until = 0;
 	}
 	want = adv_mode_wanted();
+	scan_pace_check();
 
 	if (want == ADV_OFF) {
 		err = bt_le_adv_stop();
@@ -2186,6 +2240,594 @@ static const struct bt_conn_auth_cb hid_io_cb = {
 	.cancel = hid_passkey_cancel,
 };
 
+#define HM_REPORTS 8
+#define HM_NONE 0xFFFFu
+
+struct hm_report {
+	uint8_t id;
+	uint16_t bits;
+	uint16_t x_off, y_off, wheel_off;
+	uint8_t x_size, y_size, wheel_size;
+	uint16_t btn_bit[8];
+	uint16_t mod_bit[8];
+	uint16_t keys_off;
+	uint8_t keys_n;
+	uint16_t bm_off;
+	uint16_t bm_n;
+	uint8_t bm_first;
+};
+
+struct hm_glob {
+	uint16_t page;
+	uint16_t count;
+	uint8_t size;
+	uint8_t id;
+};
+
+struct hm_run {
+	uint32_t first, last;
+};
+#define HM_RUNS 8
+
+static uint32_t hm_usage_at(const struct hm_run *run, uint8_t nrun,
+			    uint16_t page, uint32_t j)
+{
+	uint32_t u = 0;
+
+	for (uint8_t s = 0; s < nrun; s++) {
+		uint32_t n = run[s].last - run[s].first + 1U;
+
+		if (j < n) {
+			u = run[s].first + j;
+			break;
+		}
+		j -= n;
+		u = run[s].last;
+	}
+	if (!(u >> 16)) {
+		u |= (uint32_t)page << 16;
+	}
+	return u;
+}
+
+static struct hm_report *hm_report_for(struct hm_report *out, uint8_t *n,
+				       uint8_t max, uint8_t id)
+{
+	struct hm_report *r;
+
+	for (uint8_t i = 0; i < *n; i++) {
+		if (out[i].id == id) {
+			return &out[i];
+		}
+	}
+	if (*n >= max) {
+		return NULL;
+	}
+	r = &out[(*n)++];
+	memset(r, 0, sizeof(*r));
+	r->id = id;
+	r->x_off = HM_NONE;
+	r->y_off = HM_NONE;
+	r->wheel_off = HM_NONE;
+	for (uint8_t b = 0; b < 8; b++) {
+		r->btn_bit[b] = HM_NONE;
+		r->mod_bit[b] = HM_NONE;
+	}
+	return r;
+}
+
+static void hm_input(struct hm_report *r, const struct hm_glob *g,
+		     uint8_t flags, const struct hm_run *run, uint8_t nrun)
+{
+	uint32_t total = (uint32_t)r->bits + (uint32_t)g->size * g->count;
+
+	if (flags & 0x01) {
+	} else if (flags & 0x02) {
+		for (uint32_t j = 0; j < g->count; j++) {
+			uint32_t u = hm_usage_at(run, nrun, g->page, j);
+			uint32_t off = (uint32_t)r->bits + j * g->size;
+			uint16_t pg = (uint16_t)(u >> 16), id = (uint16_t)u;
+
+			if (off >= HM_NONE) {
+				break;
+			}
+			if (pg == 0x01 && (flags & 0x04)) {
+				if (id == 0x30 && r->x_off == HM_NONE) {
+					r->x_off = (uint16_t)off;
+					r->x_size = g->size;
+				} else if (id == 0x31 && r->y_off == HM_NONE) {
+					r->y_off = (uint16_t)off;
+					r->y_size = g->size;
+				} else if (id == 0x38 &&
+					   r->wheel_off == HM_NONE) {
+					r->wheel_off = (uint16_t)off;
+					r->wheel_size = g->size;
+				}
+			} else if (pg == 0x09 && g->size == 1) {
+				if (id >= 1 && id <= 8 &&
+				    r->btn_bit[id - 1] == HM_NONE) {
+					r->btn_bit[id - 1] = (uint16_t)off;
+				}
+			} else if (pg == 0x07 && g->size == 1) {
+				if (id >= 0xE0 && id <= 0xE7) {
+					if (r->mod_bit[id - 0xE0] == HM_NONE) {
+						r->mod_bit[id - 0xE0] =
+							(uint16_t)off;
+					}
+				} else if (id < 0xE0) {
+					if (!r->bm_n) {
+						r->bm_off = (uint16_t)off;
+						r->bm_first = (uint8_t)id;
+						r->bm_n = 1;
+					} else if (off == (uint32_t)r->bm_off +
+							  r->bm_n &&
+						   id == (uint32_t)r->bm_first +
+							 r->bm_n) {
+						r->bm_n++;
+					}
+				}
+			}
+		}
+	} else if ((hm_usage_at(run, nrun, g->page, 0) >> 16) == 0x07 &&
+		   g->size == 8 && !r->keys_n) {
+		r->keys_off = r->bits;
+		r->keys_n = g->count > 255 ? 255 : (uint8_t)g->count;
+	}
+	r->bits = total >= HM_NONE ? (uint16_t)(HM_NONE - 1U) : (uint16_t)total;
+}
+
+static uint8_t hm_parse(const uint8_t *m, uint16_t len, struct hm_report *out,
+			uint8_t max)
+{
+	struct hm_glob g = { 0 }, saved[2];
+	struct hm_run run[HM_RUNS];
+	uint32_t umin = 0, umax = 0;
+	bool have_min = false, have_max = false;
+	uint8_t nsaved = 0, nrun = 0, n = 0;
+	uint32_t i = 0;
+
+	while (i < len) {
+		uint8_t b = m[i++];
+		uint8_t size = b & 0x03, type = (b >> 2) & 0x03, tag = b >> 4;
+		uint32_t v = 0;
+
+		if (b == 0xFE) {
+			if (i >= len) {
+				break;
+			}
+			i += 2U + m[i];
+			continue;
+		}
+		if (size == 3) {
+			size = 4;
+		}
+		if (i + size > len) {
+			break;
+		}
+		for (uint8_t k = 0; k < size; k++) {
+			v |= (uint32_t)m[i + k] << (8 * k);
+		}
+		i += size;
+
+		if (type == 1) {
+			if (tag == 0) {
+				g.page = (uint16_t)v;
+			} else if (tag == 7) {
+				g.size = v > 255 ? 255 : (uint8_t)v;
+			} else if (tag == 8) {
+				g.id = (uint8_t)v;
+			} else if (tag == 9) {
+				g.count = v > 0xFFFFu ? 0xFFFFu : (uint16_t)v;
+			} else if (tag == 10) {
+				if (nsaved < ARRAY_SIZE(saved)) {
+					saved[nsaved++] = g;
+				}
+			} else if (tag == 11) {
+				if (nsaved) {
+					g = saved[--nsaved];
+				}
+			}
+		} else if (type == 2) {
+			uint32_t u = (size == 4) ? v : (v & 0xFFFFu);
+			bool add = false;
+			uint32_t first = u;
+
+			if (tag == 0) {
+				add = true;
+			} else if (tag == 1) {
+				if (have_max) {
+					add = true;
+					u = umax;
+					have_max = false;
+				} else {
+					umin = u;
+					have_min = true;
+				}
+			} else if (tag == 2) {
+				if (have_min) {
+					add = true;
+					first = umin;
+					have_min = false;
+				} else {
+					umax = u;
+					have_max = true;
+				}
+			}
+			if (add && nrun < HM_RUNS) {
+				run[nrun].first = first;
+				run[nrun].last = u;
+				nrun++;
+			}
+		} else if (type == 0) {
+			if (tag == 8) {
+				struct hm_report *r =
+					hm_report_for(out, &n, max, g.id);
+
+				if (r) {
+					hm_input(r, &g, (uint8_t)v, run, nrun);
+				}
+			}
+			nrun = 0;
+			have_min = false;
+			have_max = false;
+		}
+	}
+	return n;
+}
+
+static uint16_t hm_bytes(const struct hm_report *r)
+{
+	return (uint16_t)((r->bits + 7U) / 8U);
+}
+
+struct hm_ref {
+	uint16_t handle;
+	uint8_t id;
+	uint8_t type;
+};
+
+#define HM_UNBOUND 0xFF
+
+static uint8_t hm_bind(uint16_t vh, uint32_t top, const uint16_t *chr,
+		       uint8_t nchr, const struct hm_ref *ref, uint8_t nref,
+		       const struct hm_report *rep, uint8_t nrep)
+{
+	for (uint8_t c = 0; c < nchr; c++) {
+		if (chr[c] > vh && chr[c] < top) {
+			top = chr[c];
+		}
+	}
+	for (uint8_t k = 0; k < nref; k++) {
+		if (ref[k].handle <= vh || ref[k].handle >= top ||
+		    ref[k].type != 1) {
+			continue;
+		}
+		for (uint8_t j = 0; j < nrep; j++) {
+			if (rep[j].id == ref[k].id) {
+				return j;
+			}
+		}
+		break;
+	}
+	return HM_UNBOUND;
+}
+
+static uint8_t hm_by_len(const struct hm_report *rep, uint8_t nrep,
+			 uint16_t len)
+{
+	uint8_t hit = HM_UNBOUND;
+
+	for (uint8_t k = 0; k < nrep; k++) {
+		if (hm_bytes(&rep[k]) != len) {
+			continue;
+		}
+		if (hit != HM_UNBOUND) {
+			return HM_UNBOUND;
+		}
+		hit = k;
+	}
+	return hit;
+}
+
+static int32_t hm_get(const uint8_t *d, uint16_t len, uint16_t off,
+		      uint8_t size, bool sgn)
+{
+	uint32_t v = 0;
+
+	if (!size || size > 32 || (uint32_t)off + size > (uint32_t)len * 8U) {
+		return 0;
+	}
+	for (uint8_t k = 0; k < size; k++) {
+		uint16_t bit = (uint16_t)(off + k);
+
+		if (d[bit >> 3] & (1U << (bit & 7))) {
+			v |= (uint32_t)1 << k;
+		}
+	}
+	if (sgn && size < 32 && (v & ((uint32_t)1 << (size - 1)))) {
+		v |= 0xFFFFFFFFu << size;
+	}
+	return (int32_t)v;
+}
+
+#if defined(JC_LEFT)
+
+static bool hm_has_kbd(const struct hm_report *r)
+{
+	if (r->keys_n || r->bm_n) {
+		return true;
+	}
+	for (uint8_t b = 0; b < 8; b++) {
+		if (r->mod_bit[b] != HM_NONE) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool hm_kbd_decode(const struct hm_report *r, const uint8_t *d,
+			  uint16_t len, uint8_t *mods, uint8_t keys[6])
+{
+	uint8_t n = 0;
+
+	if (!hm_has_kbd(r)) {
+		return false;
+	}
+	*mods = 0;
+	memset(keys, 0, 6);
+	for (uint8_t b = 0; b < 8; b++) {
+		if (r->mod_bit[b] != HM_NONE &&
+		    hm_get(d, len, r->mod_bit[b], 1, false)) {
+			*mods |= (uint8_t)(1U << b);
+		}
+	}
+	for (uint8_t i = 0; i < r->keys_n; i++) {
+		uint8_t k = (uint8_t)hm_get(d, len,
+					    (uint16_t)(r->keys_off + 8U * i),
+					    8, false);
+
+		if (r->keys_n <= 6) {
+			keys[i] = k;
+			if (k) {
+				n = (uint8_t)(i + 1U);
+			}
+		} else if (k && n < 6) {
+			keys[n++] = k;
+		}
+	}
+	for (uint16_t i = 0; i < r->bm_n && n < 6; i++) {
+		uint16_t usage = (uint16_t)(r->bm_first + i);
+
+		if (usage >= 4 &&
+		    hm_get(d, len, (uint16_t)(r->bm_off + i), 1, false)) {
+			keys[n++] = (uint8_t)usage;
+		}
+	}
+	return true;
+}
+
+static bool kbd_decode_len(const uint8_t *d, uint16_t len, uint8_t *mods,
+			   uint8_t keys[6])
+{
+	uint8_t key_off;
+
+	if (len == 8) {
+		key_off = 2;
+	} else if (len == 7) {
+		key_off = 1;
+	} else {
+		return false;
+	}
+	*mods = d[0];
+	memcpy(keys, d + key_off, 6);
+	return true;
+}
+
+struct hm_kbd_src {
+	bool used;
+	uint8_t mods;
+	uint8_t keys[6];
+};
+
+static void hm_kbd_merge(const struct hm_kbd_src *src, uint8_t nsrc,
+			 uint8_t *mods, uint8_t keys[6])
+{
+	uint8_t used = 0, only = 0, n = 0;
+
+	for (uint8_t s = 0; s < nsrc; s++) {
+		if (src[s].used) {
+			used++;
+			only = s;
+		}
+	}
+	*mods = 0;
+	memset(keys, 0, 6);
+	if (used == 1) {
+		*mods = src[only].mods;
+		memcpy(keys, src[only].keys, 6);
+		return;
+	}
+	for (uint8_t s = 0; s < nsrc; s++) {
+		if (!src[s].used) {
+			continue;
+		}
+		*mods |= src[s].mods;
+		for (uint8_t i = 0; i < 6 && n < 6; i++) {
+			uint8_t k = src[s].keys[i];
+			bool twice = false;
+
+			if (k < 4) {
+				continue;
+			}
+			for (uint8_t j = 0; j < n; j++) {
+				twice = twice || keys[j] == k;
+			}
+			if (!twice) {
+				keys[n++] = k;
+			}
+		}
+	}
+}
+
+#else
+
+#define HM_XY 0x01
+#define HM_WHEEL 0x02
+#define HM_BTN 0x04
+
+static uint8_t hm_mouse_decode(const struct hm_report *r, const uint8_t *d,
+			       uint16_t len, int16_t *x, int16_t *y,
+			       int8_t *wheel, uint8_t *btn)
+{
+	uint8_t have = 0;
+	int32_t v;
+
+	if (r->x_off != HM_NONE && r->y_off != HM_NONE) {
+		v = hm_get(d, len, r->x_off, r->x_size, true);
+		*x = (v > 32767) ? 32767 : (v < -32768) ? -32768 : (int16_t)v;
+		v = hm_get(d, len, r->y_off, r->y_size, true);
+		*y = (v > 32767) ? 32767 : (v < -32768) ? -32768 : (int16_t)v;
+		have |= HM_XY;
+	}
+	if (r->wheel_off != HM_NONE) {
+		v = hm_get(d, len, r->wheel_off, r->wheel_size, true);
+		*wheel = (v > 127) ? 127 : (v < -128) ? -128 : (int8_t)v;
+		have |= HM_WHEEL;
+	}
+	for (uint8_t b = 0; b < 8; b++) {
+		if (r->btn_bit[b] == HM_NONE) {
+			continue;
+		}
+		if (!(have & HM_BTN)) {
+			*btn = 0;
+			have |= HM_BTN;
+		}
+		if (hm_get(d, len, r->btn_bit[b], 1, false)) {
+			*btn |= (uint8_t)(1U << b);
+		}
+	}
+	return have;
+}
+
+static bool mouse_decode_len(const uint8_t *d, uint16_t len, int16_t *x,
+			     int16_t *y, int8_t *wheel, uint8_t *btn)
+{
+	if (len == 7) {
+		*x = (int16_t)(d[2] | ((uint16_t)(d[3] & 0x0F) << 8));
+		*y = (int16_t)((d[3] >> 4) | ((uint16_t)d[4] << 4));
+		if (*x & 0x0800) {
+			*x |= (int16_t)0xF000;
+		}
+		if (*y & 0x0800) {
+			*y |= (int16_t)0xF000;
+		}
+		*btn = d[0];
+		*wheel = (int8_t)d[5];
+	} else if (len >= 6 && len <= 8) {
+		*btn = d[0];
+		*x = (int16_t)((uint16_t)d[1] | ((uint16_t)d[2] << 8));
+		*y = (int16_t)((uint16_t)d[3] | ((uint16_t)d[4] << 8));
+		*wheel = (int8_t)d[5];
+	} else if (len >= 4 && len < 6) {
+		*btn = d[0];
+		*x = (int8_t)d[1];
+		*y = (int8_t)d[2];
+		*wheel = (int8_t)d[3];
+	} else {
+		return false;
+	}
+	return true;
+}
+
+#endif
+
+#define HM_MAP_MAX 512
+#define HM_CHRS 12
+
+static uint8_t hm_map[HM_MAP_MAX];
+static uint16_t hm_map_len;
+static uint16_t hm_chr[HM_CHRS];
+static uint8_t hm_chr_n;
+static struct hm_ref hm_ref[HM_CHRS];
+static uint8_t hm_ref_n;
+static struct hm_report hm_rep[HM_REPORTS];
+static uint8_t hm_rep_n;
+static uint8_t hm_of_sub[MAX_RPT];
+static bool hm_ready;
+static uint16_t hm_sub_vh[MAX_RPT];
+static uint8_t hm_sub_n;
+static struct hm_report hm_keep_rep[HM_REPORTS];
+static uint16_t hm_keep_vh[MAX_RPT];
+static uint8_t hm_keep_of[MAX_RPT];
+static uint8_t hm_keep_n;
+static bool hm_kept;
+static bool hm_map_whole;
+#if defined(JC_LEFT)
+static struct hm_kbd_src hm_kb[MAX_RPT];
+#endif
+
+static void hm_reset(void)
+{
+	hm_ready = false;
+	hm_map_len = 0;
+	hm_chr_n = 0;
+	hm_ref_n = 0;
+	hm_rep_n = 0;
+	memset(hm_of_sub, HM_UNBOUND, sizeof(hm_of_sub));
+#if defined(JC_LEFT)
+	memset(hm_kb, 0, sizeof(hm_kb));
+#endif
+	hm_sub_n = 0;
+	hm_kept = false;
+	hm_map_whole = false;
+}
+
+static bool hm_keep_save(void)
+{
+	if (!hm_ready || !hm_sub_n || !hm_map_whole) {
+		return false;
+	}
+	memcpy(hm_keep_rep, hm_rep, sizeof(hm_keep_rep));
+	memcpy(hm_keep_vh, hm_sub_vh, sizeof(hm_keep_vh));
+	memcpy(hm_keep_of, hm_of_sub, sizeof(hm_keep_of));
+	hm_keep_n = hm_sub_n;
+	return true;
+}
+
+static const struct hm_report *hm_layout(
+	const struct bt_gatt_subscribe_params *p, uint16_t len)
+{
+	size_t i = (size_t)(p - sub_params);
+	const struct hm_report *r;
+
+	if (i >= MAX_RPT) {
+		return NULL;
+	}
+	if (!hm_ready) {
+		if (!hm_kept) {
+			return NULL;
+		}
+		for (uint8_t k = 0; k < hm_keep_n; k++) {
+			if (hm_keep_vh[k] == p->value_handle &&
+			    hm_keep_of[k] != HM_UNBOUND) {
+				r = &hm_keep_rep[hm_keep_of[k]];
+				return hm_bytes(r) == len ? r : NULL;
+			}
+		}
+		return NULL;
+	}
+	if (hm_of_sub[i] == HM_UNBOUND) {
+		uint8_t hit = hm_by_len(hm_rep, hm_rep_n, len);
+
+		if (hit == HM_UNBOUND) {
+			return NULL;
+		}
+		hm_of_sub[i] = hit;
+	}
+	r = &hm_rep[hm_of_sub[i]];
+	return hm_bytes(r) == len ? r : NULL;
+}
+
 static uint8_t mouse_notify(struct bt_conn *conn,
 			    struct bt_gatt_subscribe_params *params,
 			    const void *data, uint16_t len)
@@ -2220,18 +2862,43 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 
 #if defined(JC_LEFT)
 	{
-		uint8_t key_off;
+		const struct hm_report *lay = hm_layout(params, len);
+		uint8_t mods = 0, keys[6] = { 0 };
+		uint8_t gmods = 0, gkeys[6] = { 0 };
+		bool by_len = kbd_decode_len(d, len, &gmods, gkeys);
+		bool by_map = lay && hm_kbd_decode(lay, d, len, &mods, keys);
 
-		if (len == 8) {
-			key_off = 2;
-		} else if (len == 7) {
-			key_off = 1;
+		if (lay) {
+			size_t src = (size_t)(params - sub_params);
+
+			if (!by_map) {
+				return BT_GATT_ITER_CONTINUE;
+			}
+			if (src < MAX_RPT) {
+				bool any = mods != 0;
+
+				for (int i = 0; i < 6; i++) {
+					any = any || keys[i] != 0;
+				}
+				if (any) {
+					hm_kb[src].used = true;
+				}
+				if (hm_kb[src].used) {
+					hm_kb[src].mods = mods;
+					memcpy(hm_kb[src].keys, keys, 6);
+				}
+				hm_kbd_merge(hm_kb, MAX_RPT, &mods, keys);
+			}
 		} else {
-			return BT_GATT_ITER_CONTINUE;
+			if (!by_len) {
+				return BT_GATT_ITER_CONTINUE;
+			}
+			mods = gmods;
+			memcpy(keys, gkeys, 6);
 		}
-		kbd_mods = d[0];
+		kbd_mods = mods;
 		for (int i = 0; i < 6; i++) {
-			kbd_keys[i] = d[key_off + i];
+			kbd_keys[i] = keys[i];
 			if (kbd_keys[i]) {
 				user_input_seen();
 			}
@@ -2275,41 +2942,31 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 	return BT_GATT_ITER_CONTINUE;
 #else
 	{
-		int16_t x = 0, y = 0;
-		int8_t wheel = 0;
-		uint8_t btn = 0;
-		bool decoded = true;
+		const struct hm_report *lay = hm_layout(params, len);
+		int16_t x = 0, y = 0, gx = 0, gy = 0;
+		int8_t wheel = 0, gwheel = 0;
+		uint8_t btn = 0, gbtn = 0;
+		bool by_len = mouse_decode_len(d, len, &gx, &gy, &gwheel, &gbtn);
+		uint8_t have = lay ? hm_mouse_decode(lay, d, len, &x, &y, &wheel,
+						     &btn) : 0;
+		bool trust = lay;
+		bool decoded;
 
-		if (len == 7) {
-			x = (int16_t)(d[2] | ((uint16_t)(d[3] & 0x0F) << 8));
-			y = (int16_t)((d[3] >> 4) | ((uint16_t)d[4] << 4));
-			if (x & 0x0800) {
-				x |= (int16_t)0xF000;
-			}
-			if (y & 0x0800) {
-				y |= (int16_t)0xF000;
-			}
-			btn = d[0];
-			wheel = (int8_t)d[5];
-		} else if (len >= 6 && len <= 8) {
-			btn = d[0];
-			x = (int16_t)((uint16_t)d[1] | ((uint16_t)d[2] << 8));
-			y = (int16_t)((uint16_t)d[3] | ((uint16_t)d[4] << 8));
-			wheel = (int8_t)d[5];
-		} else if (len >= 4 && len < 6) {
-			btn = d[0];
-			x = (int8_t)d[1];
-			y = (int8_t)d[2];
-			wheel = (int8_t)d[3];
+		if (trust) {
+			decoded = have != 0;
 		} else {
-			decoded = false;
+			decoded = by_len;
+			x = gx;
+			y = gy;
+			wheel = gwheel;
+			btn = gbtn;
 		}
 
 		if (!decoded) {
 			return BT_GATT_ITER_CONTINUE;
 		}
 
-		if (rpt_handle && params->value_handle != rpt_handle) {
+		if (!trust && rpt_handle && params->value_handle != rpt_handle) {
 			return BT_GATT_ITER_CONTINUE;
 		}
 
@@ -2329,7 +2986,7 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 			}
 		}
 
-		if (rpt_handle) {
+		if (trust ? (have & HM_BTN) != 0 : rpt_handle != 0) {
 			mouse_buttons = btn;
 			if (btn) {
 				user_input_seen();
@@ -2373,20 +3030,26 @@ static uint8_t batt_read_cb(struct bt_conn *conn, uint8_t err,
 	return BT_GATT_ITER_STOP;
 }
 
-static uint8_t hogp_read_cb(struct bt_conn *conn, uint8_t err,
-			    struct bt_gatt_read_params *params,
-			    const void *data, uint16_t len)
-{
-	ARG_UNUSED(conn);
-	ARG_UNUSED(params);
-	return BT_GATT_ITER_STOP;
-}
-
 #define SCAN_INTERVAL 0x0060
 #define SCAN_WINDOW 0x0010
+#define SCAN_WINDOW_FAST 0x0050
 
 static void scan_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(scan_work, scan_work_handler);
+static bool scan_on;
+static bool scan_is_fast;
+
+static bool scan_fast_ok(void)
+{
+	return !g_conn && !g_mouse && adv_mode_wanted() == ADV_OFF;
+}
+
+static void scan_pace_check(void)
+{
+	if (scan_on && scan_is_fast != scan_fast_ok()) {
+		k_work_schedule(&scan_work, K_NO_WAIT);
+	}
+}
 
 static uint16_t ad_appearance(struct net_buf_simple *ad)
 {
@@ -2555,6 +3218,11 @@ static void scan_print(void)
 static bt_addr_le_t peer_try;
 static bool peer_trying;
 
+#define PIN_HEARD_MS 4000
+static int64_t pin_heard_at;
+static uint8_t pin_fails;
+static bool hid_link_secured;
+
 #define PEER_BAD_MAX 4
 static bt_addr_le_t peer_bad[PEER_BAD_MAX];
 static uint8_t peer_bad_n;
@@ -2714,6 +3382,8 @@ static void peer_set(const char *arg)
 	memset(&PEER, 0, sizeof(PEER));
 	peer_bad_n = 0;
 	peer_trying = false;
+	pin_fails = 0;
+	pin_heard_at = 0;
 	hid_cool_until = 0;
 	PEER.have = 1;
 	bt_addr_le_copy(&PEER.addr, &a);
@@ -2735,6 +3405,7 @@ static void peer_commit(const bt_addr_le_t *addr)
 
 	peer_bad_n = 0;
 	peer_trying = false;
+	pin_fails = 0;
 	if (!PEER.have || !bt_addr_le_cmp(&PEER.addr, addr)) {
 		return;
 	}
@@ -2777,6 +3448,7 @@ static void scan_restart(void)
 	memset(scan_seen, 0, sizeof(scan_seen));
 	scan_seen_n = 0;
 	peer_bad_n = 0;
+	pin_fails = 0;
 	hid_cool_until = 0;
 	scan_force_until = k_uptime_get() + SCAN_FORCE_MS;
 	k_work_schedule(&scan_work, K_NO_WAIT);
@@ -2794,6 +3466,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	if (g_mouse && !scan_forced()) {
 		bt_le_scan_stop();
+		scan_on = false;
 		return;
 	}
 
@@ -2812,6 +3485,9 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	if (g_mouse) {
 		return;
+	}
+	if (PEER.have && !bt_addr_le_cmp(&PEER.addr, addr)) {
+		pin_heard_at = k_uptime_get();
 	}
 	if (hid_cooling(addr)) {
 		return;
@@ -2841,6 +3517,10 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			if (peer_is_bad(addr)) {
 				return;
 			}
+			if (pin_fails < 2 && pin_heard_at &&
+			    k_uptime_get() - pin_heard_at < PIN_HEARD_MS) {
+				return;
+			}
 			bt_addr_le_copy(&peer_try, addr);
 			peer_trying = true;
 			bt_addr_le_to_str(addr, astr, sizeof(astr));
@@ -2858,6 +3538,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	if (bt_le_scan_stop()) {
 		return;
 	}
+	scan_on = false;
 
 	bt_addr_le_copy(&hid_conn_addr, addr);
 	hid_conn_pending = true;
@@ -2873,11 +3554,12 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 static void scan_work_handler(struct k_work *work)
 {
+	bool fast = scan_fast_ok();
 	struct bt_le_scan_param sp = {
 		.type = BT_LE_SCAN_TYPE_ACTIVE,
 		.options = BT_LE_SCAN_OPT_NONE,
 		.interval = SCAN_INTERVAL,
-		.window = SCAN_WINDOW,
+		.window = fast ? SCAN_WINDOW_FAST : SCAN_WINDOW,
 	};
 	int err;
 
@@ -2885,10 +3567,17 @@ static void scan_work_handler(struct k_work *work)
 	if (g_mouse && !scan_forced()) {
 		return;
 	}
+	if (!scan_on || scan_is_fast != fast) {
+		bt_le_scan_stop();
+		scan_on = false;
+	}
 	err = bt_le_scan_start(&sp, scan_cb);
 	if (err && err != -EALREADY) {
 		k_work_schedule(&scan_work, K_SECONDS(2));
+		return;
 	}
+	scan_on = true;
+	scan_is_fast = fast;
 }
 
 static void discover_next(struct bt_conn *conn, uint16_t type, uint16_t uuid16,
@@ -2902,6 +3591,103 @@ static void discover_next(struct bt_conn *conn, uint16_t type, uint16_t uuid16,
 	disc.end_handle = end;
 	disc.type = type;
 	bt_gatt_discover(conn, &disc);
+}
+
+static struct bt_gatt_read_params hm_ref_rd;
+static struct bt_gatt_read_params hm_map_rd;
+static const struct bt_uuid_16 hm_uuid_map =
+	BT_UUID_INIT_16(BT_UUID_HIDS_REPORT_MAP_VAL);
+static const struct bt_uuid_16 hm_uuid_ref =
+	BT_UUID_INIT_16(BT_UUID_HIDS_REPORT_REF_VAL);
+
+static void hm_done(void)
+{
+	hm_rep_n = hm_parse(hm_map, hm_map_len, hm_rep, HM_REPORTS);
+
+	for (uint8_t i = 0; i < sub_count && i < MAX_RPT; i++) {
+		hm_of_sub[i] = hm_bind(sub_params[i].value_handle,
+				       (uint32_t)hid_svc_end + 1U, hm_chr, hm_chr_n,
+				       hm_ref, hm_ref_n, hm_rep, hm_rep_n);
+		hm_sub_vh[i] = sub_params[i].value_handle;
+	}
+	hm_sub_n = sub_count < MAX_RPT ? sub_count : MAX_RPT;
+	hm_ready = hm_rep_n > 0;
+}
+
+static uint8_t hm_ref_cb(struct bt_conn *conn, uint8_t err,
+			 struct bt_gatt_read_params *params,
+			 const void *data, uint16_t len)
+{
+	const uint8_t *d = data;
+
+	ARG_UNUSED(conn);
+	if (d && !err) {
+		if (len >= 2 && hm_ref_n < HM_CHRS) {
+			hm_ref[hm_ref_n].handle = params->by_uuid.start_handle;
+			hm_ref[hm_ref_n].id = d[0];
+			hm_ref[hm_ref_n].type = d[1];
+			hm_ref_n++;
+		}
+		return BT_GATT_ITER_CONTINUE;
+	}
+	hm_done();
+	return BT_GATT_ITER_STOP;
+}
+
+static void hm_read_refs(struct bt_conn *conn)
+{
+	hm_ref_rd.func = hm_ref_cb;
+	hm_ref_rd.handle_count = 0;
+	hm_ref_rd.by_uuid.uuid = &hm_uuid_ref.uuid;
+	hm_ref_rd.by_uuid.start_handle = hid_svc_start;
+	hm_ref_rd.by_uuid.end_handle = hid_svc_end;
+	if (bt_gatt_read(conn, &hm_ref_rd)) {
+		hm_done();
+	}
+}
+
+static uint8_t hm_map_cb(struct bt_conn *conn, uint8_t err,
+			 struct bt_gatt_read_params *params,
+			 const void *data, uint16_t len)
+{
+	ARG_UNUSED(params);
+	if (data && !err) {
+		uint16_t room = (uint16_t)(sizeof(hm_map) - hm_map_len);
+		uint16_t n = len < room ? len : room;
+
+		memcpy(hm_map + hm_map_len, data, n);
+		hm_map_len += n;
+		if (n == len) {
+			return BT_GATT_ITER_CONTINUE;
+		}
+	}
+	hm_map_whole = !err || err == BT_ATT_ERR_INVALID_OFFSET;
+	hm_read_refs(conn);
+	return BT_GATT_ITER_STOP;
+}
+
+static uint8_t hogp_read_cb(struct bt_conn *conn, uint8_t err,
+			    struct bt_gatt_read_params *params,
+			    const void *data, uint16_t len)
+{
+	if (!data || err) {
+		hm_done();
+		return BT_GATT_ITER_STOP;
+	}
+	hm_map_len = len < sizeof(hm_map) ? len : (uint16_t)sizeof(hm_map);
+	memcpy(hm_map, data, hm_map_len);
+	if (len + 4U >= bt_gatt_get_mtu(conn)) {
+		hm_map_rd.func = hm_map_cb;
+		hm_map_rd.handle_count = 1;
+		hm_map_rd.single.handle = params->by_uuid.start_handle;
+		hm_map_rd.single.offset = hm_map_len;
+		if (!bt_gatt_read(conn, &hm_map_rd)) {
+			return BT_GATT_ITER_STOP;
+		}
+	}
+	hm_map_whole = len + 4U < bt_gatt_get_mtu(conn);
+	hm_read_refs(conn);
+	return BT_GATT_ITER_STOP;
 }
 
 static uint8_t discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -2922,9 +3708,12 @@ static uint8_t discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 			printk("[MOUSE] discovery done, %u report subscriptions\n",
 			       sub_count);
 			hid_reattached = true;
+			hid_usable_at = k_uptime_get();
+			k_work_reschedule(&hid_param_work,
+					  K_MSEC(HID_PARAM_DELAY_MS));
 			rd_params.func = hogp_read_cb;
 			rd_params.handle_count = 0;
-			rd_params.by_uuid.uuid = BT_UUID_HIDS_REPORT_MAP;
+			rd_params.by_uuid.uuid = &hm_uuid_map.uuid;
 			rd_params.by_uuid.start_handle = hid_svc_start;
 			rd_params.by_uuid.end_handle = hid_svc_end;
 			bt_gatt_read(conn, &rd_params);
@@ -2989,6 +3778,9 @@ static uint8_t discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 				      hid_svc_end);
 			return BT_GATT_ITER_STOP;
 		}
+		if (hm_chr_n < HM_CHRS) {
+			hm_chr[hm_chr_n++] = chrc->value_handle;
+		}
 		if (!(chrc->properties & BT_GATT_CHRC_NOTIFY)) {
 			return BT_GATT_ITER_CONTINUE;
 		}
@@ -3018,8 +3810,16 @@ static uint8_t discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 	return BT_GATT_ITER_CONTINUE;
 }
 
+static bt_addr_le_t hm_keep_addr;
+
 static void mouse_start_discovery(struct bt_conn *conn)
 {
+	hid_disc_started = true;
+	hm_reset();
+	if (hm_keep_n &&
+	    !bt_addr_le_cmp(&hm_keep_addr, bt_conn_get_dst(conn))) {
+		hm_kept = true;
+	}
 	sub_count = 0;
 	hid_svc_start = 0;
 	hid_svc_end = 0;
@@ -3898,6 +4698,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 				peer_mark_bad(&hid_conn_addr);
 				peer_trying = false;
 			}
+			if (PEER.have && pin_fails < 255 &&
+			    !bt_addr_le_cmp(&PEER.addr, &hid_conn_addr)) {
+				pin_fails++;
+			}
 			hid_cool(&hid_conn_addr);
 			k_work_schedule(&scan_work, K_SECONDS(1));
 			k_work_submit(&adv_work);
@@ -3914,7 +4718,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		printk("[MOUSE] *** CONNECTED to %s ***\n", astr);
 		g_mouse = bt_conn_ref(conn);
 		hid_params_asked = false;
+		hid_usable_at = 0;
+		hid_disc_started = false;
 		hid_conn_pending = false;
+		hid_link_secured = false;
 
 		hid_reattached = true;
 
@@ -3939,6 +4746,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
+	if (console_bonded && !pairable_until &&
+	    memcmp(bt_conn_get_dst(conn)->a.val, console_host, 6)) {
+		conn_refused = conn;
+		bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		return;
+	}
+
 	report_pace(info.le.interval_us);
 
 	bt_le_adv_stop();
@@ -3947,6 +4761,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	console_known = true;
 
 	g_conn = bt_conn_ref(conn);
+	scan_pace_check();
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level,
@@ -3956,6 +4771,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 		printk("[MOUSE] security level=%d err=%d\n", (int)level, (int)err);
 		if (!err) {
 			hid_want_passkey = false;
+			hid_link_secured = true;
 		} else if (err == BT_SECURITY_ERR_AUTH_REQUIREMENT &&
 			   !hid_want_passkey) {
 			hid_want_passkey = true;
@@ -3976,6 +4792,9 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 			return;
 		}
 		peer_commit(bt_conn_get_dst(conn));
+		if (hid_disc_started) {
+			return;
+		}
 		mouse_start_discovery(conn);
 	}
 }
@@ -3998,9 +4817,24 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 		printk("[MOUSE] *** DISCONNECTED, reason 0x%02x *** reports=%u\n",
 		       reason, mouse_reports);
+		if (PEER.have &&
+		    !bt_addr_le_cmp(&PEER.addr, bt_conn_get_dst(conn))) {
+			pin_heard_at = k_uptime_get();
+			if (!hid_link_secured && pin_fails < 255) {
+				pin_fails++;
+			}
+		}
 		bt_conn_unref(g_mouse);
 		g_mouse = NULL;
 		sub_count = 0;
+		hid_usable_at = 0;
+		k_work_cancel_delayable(&hid_param_work);
+		hid_disc_started = false;
+		if (hm_keep_save()) {
+			bt_addr_le_copy(&hm_keep_addr, bt_conn_get_dst(conn));
+		}
+		hm_reset();
+		batt_forget();
 		mouse_buttons = 0;
 #if defined(JC_LEFT)
 		kbd_mods = 0;
@@ -4015,6 +4849,12 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		if (was_usable && g_conn) {
 			k_work_submit(&console_drop_work);
 		}
+		return;
+	}
+
+	if (conn == conn_refused) {
+		conn_refused = NULL;
+		k_work_submit(&adv_work);
 		return;
 	}
 
@@ -4165,16 +5005,9 @@ int main(void)
 				}
 			}
 		}
-		if (g_mouse && !hid_params_asked) {
-			static const struct bt_le_conn_param fast = {
-				.interval_min = 9,
-				.interval_max = 12,
-				.latency = 0,
-				.timeout = 400,
-			};
-			bt_conn_le_param_update(g_mouse, &fast);
-
-			hid_params_asked = true;
+		if (g_mouse && !hid_params_asked && hid_usable_at &&
+		    k_uptime_get() - hid_usable_at >= HID_PARAM_DELAY_MS) {
+			hid_params_request();
 		}
 
 #if defined(JC_LEFT)
