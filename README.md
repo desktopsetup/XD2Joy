@@ -50,6 +50,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Pairing notification:** pairing notification might be off or consistent.
 - **Bad Delay for some situations:** Most input delays are fixed but delay can still happen (e.g, pairing too many Joy-Cons or turning the console on and off and reconnecting.) was an issue and other situations like this could also trigger a bad delay but repairing always fixes it. 
 - **Connection status on BT devices:** A keyboard or mouse with a LED status for being connected to something wont get trigged being connected to the switch 2 but still functions.
+- **Mouse DPI:** Depending on your mouses DPI the consistency of the sensitivity can vary.
 
 ## Hardware
 
