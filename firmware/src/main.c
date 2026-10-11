@@ -18,6 +18,7 @@
 #include "XData_left.h"
 #else
 #include "XData_right.h"
+#include "XData_gyro.h"
 #endif
 
 #include <host/keys.h>
@@ -226,7 +227,7 @@ static const volatile struct jc_cfg CFG_FLASH = {
 	.stick_gain = STICK_WHEEL_GAIN,
 #if defined(JC_LEFT)
 	.side = 0x67,
-	.n_btn = 27,
+	.n_btn = 28,
 	.stick_src_x = JC_SRC_NONE,
 	.stick_src_y = JC_SRC_NONE,
 	.col_body = { 0x4B, 0xA1, 0x6B },
@@ -261,6 +262,7 @@ static const volatile struct jc_cfg CFG_FLASH = {
 		{ 0x08, JC_BTN_KEY, BTN_ZL },
 		{ 0x0E, JC_BTN_MODE, 0x0101 },
 		{ 0x0D, JC_BTN_MODE, 0x0201 },
+		{ 0x0A, JC_BTN_MODE, 0x0301 },
 	},
 #else
 	.side = 0x66,
@@ -327,6 +329,7 @@ static bool cfg_record_ok(const struct jc_cfg *c)
 #define JC_MODE_JOYCON 0
 #define JC_MODE_KEYBOARD 1
 #define JC_MODE_STICK 2
+#define JC_MODE_GYRO 3
 static uint8_t jc_mode;
 
 static inline bool jc_live(void)
@@ -358,6 +361,9 @@ static const char *jc_mode_id_name(uint8_t m)
 {
 	if (m == JC_MODE_KEYBOARD) {
 		return "KEYBOARD";
+	}
+	if (m == JC_MODE_GYRO) {
+		return "GYRO";
 	}
 	return m == JC_MODE_STICK ? "STICK" : "JOYCON";
 }
@@ -717,6 +723,8 @@ static void cfg_cmd_fn(struct k_work *w)
 			mode_set(JC_MODE_KEYBOARD);
 		} else if (!strcmp(c, "stick")) {
 			mode_set(JC_MODE_STICK);
+		} else if (!strcmp(c, "gyro")) {
+			mode_set(JC_MODE_GYRO);
 		} else if (!strcmp(c, "joycon") || !strcmp(c, "jc")) {
 			mode_set(JC_MODE_JOYCON);
 		} else {
@@ -880,6 +888,7 @@ static void cfg_serial_init(void)
 
 #define LINK_SYNC_REQ 0x2000
 #define LINK_STICK 0x0800
+#define LINK_GYRO 0x0200
 
 #define SYNC_HOLD_MS 2000
 
@@ -953,8 +962,7 @@ static uint8_t mode_combo_wanted(void)
 	for (uint8_t j = 0; j < nb; j++) {
 		uint8_t need;
 
-		if (CFG.btn[j].kind != JC_BTN_MODE ||
-		    (CFG.btn[j].mask >> 8) > JC_MODE_STICK) {
+		if (CFG.btn[j].kind != JC_BTN_MODE) {
 			continue;
 		}
 		need = CFG.btn[j].mask & 0xFF;
@@ -1542,9 +1550,15 @@ static bool stick_on(void)
 	       (peer_buttons & LINK_STICK) != 0;
 }
 
+static bool gyro_mode_on(void)
+{
+	return !stick_on() && (jc_mode == JC_MODE_GYRO ||
+			       (peer_buttons & LINK_GYRO) != 0);
+}
+
 static bool ptr_off(void)
 {
-	return stick_on();
+	return stick_on() || gyro_mode_on();
 }
 
 #endif
@@ -3954,6 +3968,9 @@ static uint16_t link_tx_buttons(void)
 	if (jc_mode == JC_MODE_STICK) {
 		m |= LINK_STICK;
 	}
+	if (jc_mode == JC_MODE_GYRO) {
+		m |= LINK_GYRO;
+	}
 	return m;
 }
 
@@ -4119,11 +4136,47 @@ static uint16_t replay_hi = 37;
 #define SAMPLE_STRIDE 88
 #define SAMPLE_COUNT 3
 
+static const int8_t sweep_sx = -1;
+static const int8_t sweep_sy = -1;
+
 static const uint16_t sweep_qlo = 11, sweep_qhi = 58;
 static const uint16_t sweep_plo = 64, sweep_phi = 79;
+static const int16_t sweep_smooth = 6;
+static const int32_t sweep_knee = 3000;
+static int32_t pend_x, pend_y;
 
-#define RATE_AT 154
-#define RATE_STRIDE 89
+#define GYRO_A 154
+#define GYRO_STRIDE 89
+static const int8_t gyro_lr = 0;
+static const int8_t gyro_ud = 2;
+static const int16_t sweep_dead = 1;
+
+static int32_t rate_spend(int32_t *pend, int32_t add)
+{
+	int32_t d = sweep_smooth;
+	int32_t mag, out;
+
+	*pend += add;
+	mag = (*pend < 0) ? -*pend : *pend;
+
+	if (mag > sweep_knee) {
+		d = (d * sweep_knee) / mag;
+		if (d < 1) {
+			d = 1;
+		}
+	}
+	if (*pend > -d && *pend < d) {
+		out = *pend;
+	} else {
+		out = *pend / d;
+	}
+	*pend -= out;
+	return out;
+}
+
+static const int16_t sweep_gainr = 32;
+
+static int16_t rpt_dx, rpt_dy;
 
 static void motion_put(uint8_t *r, uint16_t bit, int16_t v, uint8_t w)
 {
@@ -4167,9 +4220,367 @@ static uint32_t isqrt32(uint32_t n)
 	return y;
 }
 
+static uint8_t rot_test;
+static uint16_t rot_bidx;
+static int16_t tri_vx, tri_vy;
+
+static const uint8_t rot_blen = 89;
+
+static int16_t rot_clamp16(int32_t v)
+{
+	return (int16_t)((v > 32767) ? 32767 : (v < -32768) ? -32768 : v);
+}
+
+#define JM_ONE (1L << 30)
+#define JM_ACC_A 100
+#define JM_GYR_A 142
+#define JM_ACC_B 190
+#define JM_GYR_B 229
+#define JM_ACC_C 277
+#define JM_Q_HDR 32
+#define JM_Q_IDX 34
+#define JM_Q_PART 37
+#define JM_HALF_NUM 148985
+#define JM_HALF_DEN 1000
+#define JM_TILT_STOP 985
+
+static int32_t jm_q[4];
+static int32_t jm_t[4];
+static int32_t jm_up0[3];
+static uint32_t jm_ms;
+static bool jm_live;
+static const int16_t jm_gain = 32;
+
+static uint32_t jm_get(const uint8_t *r, uint16_t bit, uint8_t w)
+{
+	uint32_t v = 0;
+	uint8_t i;
+
+	for (i = 0; i < w; i++) {
+		uint16_t p = (uint16_t)(bit + i);
+
+		v |= (uint32_t)((r[MOTION_AT + (p >> 3)] >> (p & 7)) & 1U) << i;
+	}
+	return v;
+}
+
+static int32_t jm_gets(const uint8_t *r, uint16_t bit, uint8_t w)
+{
+	uint32_t v = jm_get(r, bit, w);
+
+	return (v & (1UL << (w - 1))) ? (int32_t)v - (int32_t)(1UL << w)
+				      : (int32_t)v;
+}
+
+static void jm_put(uint8_t *r, uint16_t bit, uint8_t w, uint32_t v)
+{
+	uint8_t i;
+
+	for (i = 0; i < w; i++) {
+		uint16_t p = (uint16_t)(bit + i);
+		uint8_t m = (uint8_t)(1U << (p & 7));
+
+		if ((v >> i) & 1U) {
+			r[MOTION_AT + (p >> 3)] |= m;
+		} else {
+			r[MOTION_AT + (p >> 3)] &= (uint8_t)~m;
+		}
+	}
+}
+
+static void jm_qmul(const int32_t a[4], const int32_t b[4], int32_t o[4])
+{
+	o[0] = (int32_t)(((int64_t)a[0] * b[0] - (int64_t)a[1] * b[1] -
+			  (int64_t)a[2] * b[2] - (int64_t)a[3] * b[3]) >> 30);
+	o[1] = (int32_t)(((int64_t)a[0] * b[1] + (int64_t)a[1] * b[0] +
+			  (int64_t)a[2] * b[3] - (int64_t)a[3] * b[2]) >> 30);
+	o[2] = (int32_t)(((int64_t)a[0] * b[2] - (int64_t)a[1] * b[3] +
+			  (int64_t)a[2] * b[0] + (int64_t)a[3] * b[1]) >> 30);
+	o[3] = (int32_t)(((int64_t)a[0] * b[3] + (int64_t)a[1] * b[2] -
+			  (int64_t)a[2] * b[1] + (int64_t)a[3] * b[0]) >> 30);
+}
+
+static void jm_qnorm(int32_t q[4])
+{
+	int64_t n2 = 0;
+	int32_t f;
+	uint8_t i;
+
+	for (i = 0; i < 4; i++) {
+		n2 += (int64_t)q[i] * q[i];
+	}
+	f = (int32_t)(((3LL << 30) - (n2 >> 30)) >> 1);
+	for (i = 0; i < 4; i++) {
+		q[i] = (int32_t)(((int64_t)q[i] * f) >> 30);
+	}
+}
+
+static void jm_exp(const int32_t h[3], int32_t d[4])
+{
+	int32_t p[3] = { h[0] / 4, h[1] / 4, h[2] / 4 };
+	int32_t h2 = (int32_t)(((int64_t)p[0] * p[0] + (int64_t)p[1] * p[1] +
+				(int64_t)p[2] * p[2]) >> 30);
+	int32_t f = (int32_t)(JM_ONE - h2 / 6);
+	int32_t a[4], b[4];
+	uint8_t i;
+
+	a[0] = (int32_t)(JM_ONE - h2 / 2);
+	for (i = 0; i < 3; i++) {
+		a[1 + i] = (int32_t)(((int64_t)p[i] * f) >> 30);
+	}
+	jm_qmul(a, a, b);
+	jm_qnorm(b);
+	jm_qmul(b, b, d);
+	jm_qnorm(d);
+}
+
+static void jm_turn(int32_t q[4], const int32_t h[3])
+{
+	int32_t d[4], o[4];
+
+	jm_exp(h, d);
+	jm_qmul(q, d, o);
+	memcpy(q, o, sizeof(o));
+	jm_qnorm(q);
+}
+
+static void jm_turn_base(int32_t q[4], const int32_t h[3])
+{
+	int32_t d[4], o[4];
+
+	jm_exp(h, d);
+	jm_qmul(d, q, o);
+	memcpy(q, o, sizeof(o));
+	jm_qnorm(q);
+}
+
+static void jm_unpack(const uint8_t *r, int32_t q[4])
+{
+	uint8_t idx = (uint8_t)jm_get(r, JM_Q_IDX, 2), i;
+	int64_t n2 = 1LL << 40;
+	int32_t v[3], big;
+	uint32_t root;
+
+	for (i = 0; i < 3; i++) {
+		v[i] = (int32_t)jm_get(r, (uint16_t)(JM_Q_PART + 21 * i), 21) -
+		       (1L << 20);
+		n2 += (int64_t)v[i] * v[i];
+	}
+	root = isqrt32((uint32_t)(n2 >> 12)) << 6;
+	big = (int32_t)((1LL << 50) / root);
+	q[idx] = big;
+	for (i = 0; i < 3; i++) {
+		q[(idx + 1 + i) & 3] = (int32_t)(((int64_t)v[i] * big) >> 20);
+	}
+	jm_qnorm(q);
+}
+
+static void jm_pack(uint8_t *r, const int32_t q[4])
+{
+	uint8_t idx = 0, i;
+
+	for (i = 1; i < 4; i++) {
+		int32_t a = (q[i] < 0) ? -q[i] : q[i];
+		int32_t b = (q[idx] < 0) ? -q[idx] : q[idx];
+
+		if (a > b) {
+			idx = i;
+		}
+	}
+	jm_put(r, JM_Q_HDR, 2, 3);
+	jm_put(r, JM_Q_IDX, 2, idx);
+	jm_put(r, JM_Q_IDX + 2, 1, 0);
+	for (i = 0; i < 3; i++) {
+		int64_t v = (((int64_t)q[(idx + 1 + i) & 3]) << 20) / q[idx];
+
+		v += 1L << 20;
+		v = (v < 0) ? 0 : (v > (1L << 21) - 1) ? (1L << 21) - 1 : v;
+		jm_put(r, (uint16_t)(JM_Q_PART + 21 * i), 21, (uint32_t)v);
+	}
+}
+
+static void jm_to_body(const int32_t q[4], int32_t v[3])
+{
+	int64_t w = q[0], x = q[1], y = q[2], z = q[3];
+	int64_t m[9], o[3];
+	uint8_t i;
+
+	m[0] = (int64_t)JM_ONE - ((2 * (y * y + z * z)) >> 30);
+	m[1] = (2 * (x * y - w * z)) >> 30;
+	m[2] = (2 * (x * z + w * y)) >> 30;
+	m[3] = (2 * (x * y + w * z)) >> 30;
+	m[4] = (int64_t)JM_ONE - ((2 * (x * x + z * z)) >> 30);
+	m[5] = (2 * (y * z - w * x)) >> 30;
+	m[6] = (2 * (x * z - w * y)) >> 30;
+	m[7] = (2 * (y * z + w * x)) >> 30;
+	m[8] = (int64_t)JM_ONE - ((2 * (x * x + y * y)) >> 30);
+	for (i = 0; i < 3; i++) {
+		o[i] = (m[i] * v[0] + m[3 + i] * v[1] + m[6 + i] * v[2] +
+			(1LL << 29)) >> 30;
+	}
+	for (i = 0; i < 3; i++) {
+		v[i] = (int32_t)o[i];
+	}
+}
+
+static void jm_reset(void)
+{
+	jm_live = false;
+}
+
+static void jm_apply(uint8_t *r, int32_t vx, int32_t vy)
+{
+	uint32_t now = k_uptime_get_32();
+	uint32_t dms;
+	int32_t acc[3][3], g[2][3], up[3], w[3], h[3], was[4], d[4];
+	int64_t lr, ud, big;
+	uint8_t s, k;
+
+	for (k = 0; k < 3; k++) {
+		acc[0][k] = jm_gets(r, (uint16_t)(JM_ACC_A + 14 * k), 14);
+		acc[1][k] = jm_gets(r, (uint16_t)(JM_ACC_B + 13 * k), 13);
+		acc[2][k] = jm_gets(r, (uint16_t)(JM_ACC_C + 14 * k), 14);
+		g[0][k] = jm_gets(r, (uint16_t)(JM_GYR_A + 16 * k), 16);
+		g[1][k] = jm_gets(r, (uint16_t)(JM_GYR_B + 16 * k), 16);
+	}
+	if (!jm_live) {
+		uint32_t len = isqrt32((uint32_t)((int64_t)acc[0][0] * acc[0][0] +
+						  (int64_t)acc[0][1] * acc[0][1] +
+						  (int64_t)acc[0][2] * acc[0][2]));
+
+		jm_unpack(r, jm_q);
+		jm_t[0] = JM_ONE;
+		jm_t[1] = 0;
+		jm_t[2] = 0;
+		jm_t[3] = 0;
+		for (k = 0; k < 3; k++) {
+			jm_up0[k] = (int32_t)((((int64_t)acc[0][k]) << 30) /
+					      (int64_t)(len ? len : 1U));
+		}
+		jm_ms = now - REPORT_MS;
+		jm_live = true;
+	}
+	dms = now - jm_ms;
+	jm_ms = now;
+	dms = (dms < 1U) ? 1U : (dms > 2000U) ? 2000U : dms;
+
+	memcpy(up, jm_up0, sizeof(up));
+	jm_to_body(jm_t, up);
+
+	lr = (int64_t)vx * jm_gain * REPORT_MS / (16 * (int64_t)dms);
+	ud = (int64_t)vy * jm_gain * REPORT_MS / (16 * (int64_t)dms);
+	big = ((lr < 0) ? -lr : lr) + ((ud < 0) ? -ud : ud);
+	if (big > 32000) {
+		lr = lr * 32000 / big;
+		ud = ud * 32000 / big;
+	}
+	{
+		int64_t stop = (int64_t)JM_TILT_STOP * (JM_ONE / 1000);
+		int64_t hi = 32767, lo = 32767;
+
+		if (up[2] > 0) {
+			int64_t den = (int64_t)up[2] * dms;
+
+			hi = (stop > up[1]) ? (stop - up[1]) * 3603604 / den : 0;
+			lo = (stop > -up[1]) ? (stop + up[1]) * 3603604 / den : 0;
+		} else if (up[1] > 0) {
+			hi = 0;
+		} else {
+			lo = 0;
+		}
+		ud = (ud > hi) ? hi : (ud < -lo) ? -lo : ud;
+	}
+
+	memcpy(was, jm_t, sizeof(was));
+	h[0] = (int32_t)((ud * dms * JM_HALF_NUM) / JM_HALF_DEN);
+	h[1] = 0;
+	h[2] = 0;
+	jm_turn(jm_t, h);
+	big = (lr * dms * JM_HALF_NUM) / JM_HALF_DEN;
+	for (k = 0; k < 3; k++) {
+		h[k] = (int32_t)((big * jm_up0[k]) >> 30);
+	}
+	jm_turn_base(jm_t, h);
+
+	was[1] = -was[1];
+	was[2] = -was[2];
+	was[3] = -was[3];
+	jm_qmul(was, jm_t, d);
+	{
+		int32_t v2 = (int32_t)(((int64_t)d[1] * d[1] + (int64_t)d[2] * d[2] +
+					(int64_t)d[3] * d[3]) >> 30);
+		int32_t v4 = (int32_t)(((int64_t)v2 * v2) >> 30);
+		int64_t f = (int64_t)JM_ONE + v2 / 6 + (int64_t)3 * v4 / 40;
+		int64_t den = (int64_t)JM_HALF_NUM * dms;
+
+		for (k = 0; k < 3; k++) {
+			int64_t num = ((((int64_t)d[1 + k] * f) >> 30) *
+				       ((d[0] < 0) ? -1 : 1)) * JM_HALF_DEN;
+
+			w[k] = (int32_t)((num + ((num < 0) ? -den / 2 : den / 2)) / den);
+		}
+	}
+
+	for (s = 0; s < 3; s++) {
+		jm_to_body(jm_t, acc[s]);
+	}
+	for (k = 0; k < 3; k++) {
+		g[0][k] = rot_clamp16(g[0][k] + w[k]);
+		g[1][k] = rot_clamp16(g[1][k] + w[k]);
+		h[k] = (int32_t)(((int64_t)(g[0][k] + g[1][k]) * dms * JM_HALF_NUM) /
+				 (2 * JM_HALF_DEN));
+	}
+	jm_turn(jm_q, h);
+
+	jm_put(r, 0, 12, now & 0xFFFU);
+	jm_put(r, 12, 12, dms);
+	jm_pack(r, jm_q);
+	for (k = 0; k < 3; k++) {
+		jm_put(r, (uint16_t)(JM_ACC_A + 14 * k), 14, (uint32_t)acc[0][k]);
+		jm_put(r, (uint16_t)(JM_ACC_B + 13 * k), 13, (uint32_t)acc[1][k]);
+		jm_put(r, (uint16_t)(JM_ACC_C + 14 * k), 14, (uint32_t)acc[2][k]);
+		jm_put(r, (uint16_t)(JM_GYR_A + 16 * k), 16, (uint32_t)g[0][k]);
+		jm_put(r, (uint16_t)(JM_GYR_B + 16 * k), 16, (uint32_t)g[1][k]);
+	}
+}
+
+static void rot_apply(uint8_t *r)
+{
+	memcpy(r + ROT_PLAY_AT, ROT_PLAY[rot_bidx], ROT_PLAY_LEN);
+	jm_apply(r, tri_vx, tri_vy);
+	if (++rot_bidx >= rot_blen) {
+		rot_bidx = 0;
+	}
+	tri_vx = 0;
+	tri_vy = 0;
+}
+
+static void rot_test_set(int n)
+{
+	jm_reset();
+	rot_test = (uint8_t)n;
+	rot_bidx = 0;
+	pend_x = 0;
+	pend_y = 0;
+}
+
+static const uint8_t gyro_auto = 7;
+static bool gyro_auto_in;
+
+static void gyro_auto_track(void)
+{
+	bool want = gyro_mode_on();
+
+	if (want == gyro_auto_in) {
+		return;
+	}
+	gyro_auto_in = want;
+	rot_test_set(want ? gyro_auto : 0);
+}
+
 static void sweep_apply(uint8_t *r)
 {
-	uint8_t s, sm, k;
+	uint8_t s;
 
 	for (s = 0; s < sweep_slots; s++) {
 		uint16_t base = (uint16_t)(56 + s * SAMPLE_STRIDE);
@@ -4188,10 +4599,28 @@ static void sweep_apply(uint8_t *r)
 				(uint8_t)~(0x80u >> (bit & 7));
 		}
 	}
+	int32_t dx = rpt_dx, dy = rpt_dy, vx, vy;
+	int16_t f[3] = { 0, 0, 0 };
+	uint8_t sm, k;
+
+	if (dx <= sweep_dead && dx >= -sweep_dead) {
+		dx = 0;
+	}
+	if (dy <= sweep_dead && dy >= -sweep_dead) {
+		dy = 0;
+	}
+	vx = rate_spend(&pend_x, dx * sweep_gainr * sweep_sx);
+	vy = rate_spend(&pend_y, dy * sweep_gainr * sweep_sy);
+	vx = (vx > 32767) ? 32767 : (vx < -32768) ? -32768 : vx;
+	vy = (vy > 32767) ? 32767 : (vy < -32768) ? -32768 : vy;
+	f[gyro_lr] = (int16_t)vx;
+	f[gyro_ud] = (int16_t)vy;
+	tri_vx = (int16_t)vx;
+	tri_vy = (int16_t)vy;
 	for (sm = 0; sm < 2; sm++) {
 		for (k = 0; k < 3; k++) {
-			motion_put(r, (uint16_t)(RATE_AT + sm * RATE_STRIDE +
-						 k * 16), 0, 16);
+			motion_put(r, (uint16_t)(GYRO_A + sm * GYRO_STRIDE +
+						 k * 16), f[k], 16);
 		}
 	}
 }
@@ -4263,7 +4692,7 @@ static void send_report(void)
 		buttons |= cfg_mask_for(JC_BTN_KEY) | cfg_mask_for(JC_BTN_MOD);
 	}
 
-	buttons |= peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK);
+	buttons |= peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK | LINK_GYRO);
 	r[0x02] = buttons & 0xFF;
 	r[0x03] = buttons >> 8;
 	if (grip_byte >= 0) {
@@ -4325,7 +4754,7 @@ static void send_report(void)
 		}
 	}
 
-	buttons |= peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK);
+	buttons |= peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK | LINK_GYRO);
 	buttons |= wheel_btn_now();
 	r[0x02] = buttons & 0xFF;
 	r[0x03] = buttons >> 8;
@@ -4387,10 +4816,16 @@ static void send_report(void)
 
 	{
 		int32_t dx_all = mouse_dx;
+		int16_t gyro_dx, gyro_dy;
 		int32_t dy_all = mouse_dy;
+		int16_t dx, dy;
 
 		mouse_dx -= dx_all;
 		mouse_dy -= dy_all;
+		dx = (dx_all > 32767) ? 32767 : (dx_all < -32768) ? -32768 : dx_all;
+		dy = (dy_all > 32767) ? 32767 : (dy_all < -32768) ? -32768 : dy_all;
+		gyro_dx = dx;
+		gyro_dy = dy;
 		if (ptr_off()) {
 			r[0x0D] = 0xFF;
 		}
@@ -4410,14 +4845,22 @@ static void send_report(void)
 		r[0x0A] = (wx >> 8) & 0xFF;
 		r[0x0B] = wy & 0xFF;
 		r[0x0C] = (wy >> 8) & 0xFF;
+
+		rpt_dx = gyro_mode_on() ? gyro_dx : 0;
+		rpt_dy = gyro_mode_on() ? gyro_dy : 0;
 	}
 
 	sweep_apply(r);
 
-	uint16_t t = (uint16_t)((k_uptime_get() * 602) / 1000);
+	if (rot_test) {
+		rot_apply(r);
+	}
+	if (!rot_test) {
+		uint16_t t = (uint16_t)((k_uptime_get() * 602) / 1000);
 
-	r[MOTION_AT + 5] = (uint8_t)(t & 0xFF);
-	r[MOTION_AT + 6] = (uint8_t)(t >> 8);
+		r[MOTION_AT + 5] = (uint8_t)(t & 0xFF);
+		r[MOTION_AT + 6] = (uint8_t)(t >> 8);
+	}
 #endif
 
 	{
@@ -4552,7 +4995,7 @@ static void sync_tick(void)
 static bool wake_home_held(void)
 {
 	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
-	uint16_t b = (peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK)) |
+	uint16_t b = (peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK | LINK_GYRO)) |
 		     wheel_btn_now();
 
 	for (uint8_t j = 0; j < nb; j++) {
@@ -4657,6 +5100,7 @@ static void report_thread(void *a, void *b, void *c)
 		flush_pending_responses();
 		sync_tick();
 #if !defined(JC_LEFT)
+		gyro_auto_track();
 		wake_tick();
 #endif
 		send_report();
