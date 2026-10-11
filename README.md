@@ -44,7 +44,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 ## Bugs
 
--**Gyro mode:** In testing its pretty accurate and smooth with the acceleration of a mouse its just the Y axis caps at a certain distance.
+- **Gyro mode:** In testing its pretty accurate and smooth with the acceleration of a mouse its just the Y axis caps at a certain distance.
 - **Bluetooth Classic:** Bluetooth Classic/Bluetooth 3.0 devices are not compatible and is a bug that can not be fixed since it is not Bluetooth Low Energy (BLE). 
 - **Connecting:** Sometimes when you do a fresh disconnect or new pair to the console only 1 of the Bluetooth devices pair and it takes backing out a couple times for it to recognize the other one.
 - **Snapping on slow mouse movement:** slow movements can snap visually, in both Mouse Mode and Thumbstick Mode. The Thumbstick Mode has a setting in the Web-Tool that helps.
