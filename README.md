@@ -10,14 +10,13 @@ consumer friendly version that is in development and is ran on this same firmwar
 ## Contents
 
 - [Features](#features)
-- [Known bugs](#known-bugs)
+- [Known bugs](#bugs)
 - [Hardware](#hardware)
 - [Dongle vs DIY setup](#dongle-vs-diy-setup)
 - [Setup](#setup)
 - [Building](#building)
 - [Flashing the firmware](#flashing-the-firmware)
 - [Using it in the web tool](#using-it-in-the-web-tool)
-- [Notes and limits](#notes-and-limits)
 - [License](#license)
 
 ## Features
