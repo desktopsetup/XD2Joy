@@ -52,6 +52,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Bad Delay for some situations:** Most input delays are fixed but delay can still happen (e.g, pairing too many Joy-Cons or turning the console on and off and reconnecting.) was an issue and other situations like this could also trigger a bad delay but repairing always fixes it. 
 - **Connection status on BT devices:** A keyboard or mouse with a LED status for being connected to something wont get trigged being connected to the switch 2 but still functions.
 - **Mouse DPI:** Depending on your mouses DPI the consistency of the sensitivity can vary.
+- **Not repairing back to the console:** The device should have no issues pairing back with the same device that was last used, in some cases it might not. If that happens hold the unpair button "F12, default" to have it disconnect from the console, and repair in change grip/order.
 
 ## Hardware
 
