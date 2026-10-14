@@ -43,7 +43,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 ## Bugs
 
-- **Gyro mode:** In testing its pretty accurate and smooth with the acceleration of a mouse. The Y axis might be an issue but I think it depends on the game itself it might not be an actual bug.
+- **Gyro mode:** It works good but the state is more vulnerable for random inputs sent to the console, its only certain triggers it shouldn't always happen but in my case with gyro mode ON, backing out to the home menu then going back into the game it will send the "Y" Button input.
 - **Bluetooth Classic:** Bluetooth Classic/Bluetooth 3.0 devices are not compatible and is a bug that can not be fixed since it is not Bluetooth Low Energy (BLE). 
 - **Connecting:** Sometimes when you do a fresh disconnect or new pair to the console only 1 of the Bluetooth devices pair and it takes backing out a couple times for it to recognize the other one.
 - **Snapping on slow mouse movement:** slow movements can snap visually, in both Mouse Mode and Thumbstick Mode. The Thumbstick Mode has a setting in the Web-Tool that helps.
