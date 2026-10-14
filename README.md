@@ -11,7 +11,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 - [Features](#features)
 - [Known bugs](#bugs)
-- [Hardware](#hardware)
+- [Hardware setup](#hardware)
 - [Dongle vs DIY setup](#dongle-vs-diy-setup)
 - [Setup](#setup)
 - [Building](#building)
