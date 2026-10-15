@@ -5,7 +5,7 @@
 This firmware makes 2 nRF52840 chips appear to a Switch 2 as a left and right Joy-Con.
 The left side is the Bluetooth keyboard, the right as the Bluetooth mouse. The inputs can link with each other making it possible to have the Keyboard (left Joy-Con) send (right Joy-Con) input like A, B, X, Y, etc. making up for the little amount of inputs on most mice. It runs on a pair of Pro Micro nRF52840 boards and everything is set up in the browser with
 the [XD2Joy Web tool](https://desktopsetup.github.io/XD2Joy-Webtool/) making it more customizable. The **XD2Joy dongle** will be a
-consumer friendly version that is in development and is ran on this same firmware. **Wired support is being implemented in a future firmware update** 
+consumer friendly version that is in development and is ran on this same firmware. **Wired peripheral support is being implemented in a future firmware update** 
 
 ## Contents
 
@@ -27,6 +27,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Keyboard mode:** The left half acts as a USB plugged keyboard for typing.
 - **Unpairing:**  If you want to disconnect from the console fully holding F12 removes the devices from the console.
 - **Crossmapping:** A keyboard can send A, B inputs and still act as the left Joy-Con, its vice versa for the mouse too.
+- **Split Device Connection:** This fakes one Joy-Con sides state to the console as connected, so inputs go through for each other. You no longer need 2 peripherals to connect to the console and can now control both Joy-Cons from a single device without having to pair another.
 - **Mouse mode:** A Bluetooth mouse emulates the Joy-Cons mouse state.
 - **Thumbstick mode:** A mouse can also control the right stick.
 - **Gyro Mode:** Emulate Gyro with the mouse.
@@ -36,7 +37,6 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Wake:** Wake up the console with home button.
 - **Reconnecting:** If you do a soft removal of the paired devices they reconnect back to the console based on if you interact with them like a Joy-Con would.
 - **Colors:** You can change Joy-Con colors when the devices are paired to the console.
-
 
 <img src="Pair.jpg" width="900">
 
