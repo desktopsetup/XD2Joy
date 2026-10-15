@@ -60,7 +60,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 <img src="DevExample.png" width="500">
 
-Make sure the wires make good contact if they touch each other it can feel like a firmware bug with random inputs sent to the console sometimes. Both boards should share the same ground, so if you for whatever reason have them in 2 separate power sources wire them with GND.
+Make sure the wires make good contact if they touch each other it can feel like a firmware bug with random inputs sent to the console sometimes. Both boards should share the same ground, so if you for whatever reason have them in 2 separate power sources wire them with GND. **(Its configurable now to set the left as the mouse and the right side as keyboard, in the [Web-Tool](https://github.com/desktopsetup/XD2Joy-Webtool), but still wire them like this).**
 
 ## Dongle vs DIY setup
 
