@@ -169,8 +169,9 @@ static const uint8_t RSP_08_01[] = {
 
 #define JC_CFG_MAGIC0 0x32434A55UL
 #define JC_CFG_MAGIC1 0x1A5F4247UL
-#define JC_CFG_BTNS 32
-#define JC_CFG_VER 3
+#define JC_CFG_BTNS 64
+#define JC_CFG_VER 4
+#define JC_CFG_V3_BTNS 32
 
 #define JC_SRC_NONE 0
 #define JC_SRC_DX 1
@@ -188,12 +189,18 @@ static const uint8_t RSP_08_01[] = {
 #define JC_BTN_SET 8
 #define JC_BTN_WHEEL 9
 #define JC_BTN_WPEER 10
+#define JC_BTN_PSTICK 11
+#define JC_BTN_MSTICK 12
+#define JC_BTN_WSTICK 13
+#define JC_BTN_MPSTICK 14
+#define JC_BTN_WPSTICK 15
 #define WHEEL_PULSE_MS 90
 #define JC_SET_STICK_GAIN 1
 #define JC_SET_MOUSE_GAIN 2
 #define JC_SET_ACCEL 3
 #define JC_SET_STICK_DZ 4
 #define JC_SET_STICK_VG 5
+#define JC_SET_GYRO_GAIN 6
 
 #define JC_STICK(dx, dy) ((uint16_t)((((uint16_t)(uint8_t)(int8_t)(dy)) << 8) | ((uint16_t)(uint8_t)(int8_t)(dx))))
 
@@ -219,6 +226,13 @@ struct jc_cfg {
 	struct jc_cfg_btn btn[JC_CFG_BTNS];
 	uint32_t magic_end;
 };
+
+#define JC_CFG_V3_SIZE (offsetof(struct jc_cfg, btn) + \
+			JC_CFG_V3_BTNS * sizeof(struct jc_cfg_btn) + sizeof(uint32_t))
+BUILD_ASSERT(offsetof(struct jc_cfg, btn) == 28, "config header is 28 bytes");
+BUILD_ASSERT(sizeof(struct jc_cfg) == 28 + JC_CFG_BTNS * 4 + 4,
+	     "config blob is header, entries, end marker, no padding");
+BUILD_ASSERT(JC_CFG_V3_SIZE == 160, "a v3 record is 160 bytes");
 
 static const volatile struct jc_cfg CFG_FLASH = {
 	.magic0 = JC_CFG_MAGIC0,
@@ -266,21 +280,24 @@ static const volatile struct jc_cfg CFG_FLASH = {
 	},
 #else
 	.side = 0x66,
-	.n_btn = 7,
+	.n_btn = 10,
 	.stick_src_x = JC_SRC_NONE,
-	.stick_src_y = JC_SRC_WHEEL,
+	.stick_src_y = JC_SRC_NONE,
 	.col_body = { 0x4B, 0xA1, 0x6B },
 	.col_buttons = { 0xD5, 0x4C, 0x58 },
 	.col_rail = { 0x54, 0x3E, 0x38 },
 	.col_stick = { 0xF7, 0x82, 0x6F },
 	.btn = {
 		{ 0x01, JC_BTN_MOUSE, RBTN_R },
+		{ 0x02, JC_BTN_WSTICK, JC_STICK(0, -1) },
+		{ 0x01, JC_BTN_WSTICK, JC_STICK(0, 1) },
 		{ 0x02, JC_BTN_MOUSE, RBTN_ZR },
 		{ JC_SET_STICK_GAIN, JC_BTN_SET, 10 },
 		{ JC_SET_MOUSE_GAIN, JC_BTN_SET, 420 },
 		{ JC_SET_ACCEL, JC_BTN_SET, 1 },
 		{ JC_SET_STICK_DZ, JC_BTN_SET, 290 },
 		{ JC_SET_STICK_VG, JC_BTN_SET, 5 },
+		{ JC_SET_GYRO_GAIN, JC_BTN_SET, 32 },
 	},
 #endif
 	.magic_end = JC_CFG_MAGIC0,
@@ -324,6 +341,23 @@ static bool cfg_record_ok(const struct jc_cfg *c)
 		return false;
 	}
 	return true;
+}
+
+static bool cfg_from_record(const uint8_t *raw, size_t len, struct jc_cfg *out)
+{
+	if (len == sizeof(*out)) {
+		memcpy(out, raw, sizeof(*out));
+		return true;
+	}
+	if (len == JC_CFG_V3_SIZE && (raw[8] | (raw[9] << 8)) == 3) {
+		memset(out, 0, sizeof(*out));
+		memcpy(out, raw, JC_CFG_V3_SIZE - sizeof(uint32_t));
+		memcpy(&out->magic_end, raw + JC_CFG_V3_SIZE - sizeof(uint32_t),
+		       sizeof(uint32_t));
+		out->version = JC_CFG_VER;
+		return true;
+	}
+	return false;
 }
 
 #define JC_MODE_JOYCON 0
@@ -396,6 +430,7 @@ struct jc_prof_key {
 static struct jc_prof_key prof_key[JC_PROFILES];
 
 #define SYNC_KEY 0x45
+#define SYNC_MOUSE 0xF0
 struct jc_sync_key {
 	uint8_t code;
 	uint8_t mods;
@@ -403,13 +438,29 @@ struct jc_sync_key {
 };
 static struct jc_sync_key sync_key = { SYNC_KEY, 0, 1 };
 
+#define SINGLE_OFF 0
+#define SINGLE_KBD 1
+#define SINGLE_MOUSE 2
+static uint8_t single_dev;
+static uint8_t single_gen;
+
+static bool single_follows(void)
+{
+#if defined(JC_LEFT)
+	return single_dev == SINGLE_MOUSE;
+#else
+	return single_dev == SINGLE_KBD;
+#endif
+}
+
 static void cfg_apply(const struct jc_cfg *c);
 static bool prof_filled(uint8_t n);
 
 static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 		   void *cb_arg)
 {
-	struct jc_cfg tmp;
+	static struct jc_cfg tmp;
+	static uint8_t raw[sizeof(struct jc_cfg)];
 	const char *next;
 	ssize_t n;
 
@@ -429,15 +480,14 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 
 		for (i = 0; i < JC_PROFILES; i++) {
 			char k[3] = { 'p', (char)('1' + i), '\0' };
-			struct jc_cfg t;
 
 			if (!settings_name_steq(name, k, &next) || next) {
 				continue;
 			}
-			if (len == sizeof(t) &&
-			    read_cb(cb_arg, &t, sizeof(t)) == (ssize_t)sizeof(t) &&
-			    cfg_record_ok(&t)) {
-				memcpy(&prof_slot[i], &t, sizeof(t));
+			if (len <= sizeof(raw) &&
+			    read_cb(cb_arg, raw, len) == (ssize_t)len &&
+			    cfg_from_record(raw, len, &tmp) && cfg_record_ok(&tmp)) {
+				memcpy(&prof_slot[i], &tmp, sizeof(tmp));
 				prof_have |= (uint8_t)(1U << i);
 			}
 			return 0;
@@ -474,6 +524,16 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 		}
 		return 0;
 	}
+	if (settings_name_steq(name, "single", &next) && !next) {
+		uint8_t v[2] = { 0, 0 };
+
+		if ((len == 1 || len == 2) &&
+		    read_cb(cb_arg, v, len) == (ssize_t)len && v[0] <= SINGLE_MOUSE) {
+			single_dev = v[0];
+			single_gen = v[1] & 63;
+		}
+		return 0;
+	}
 	if (settings_name_steq(name, "grip", &next) && !next) {
 		uint8_t on;
 
@@ -486,14 +546,19 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 	if (!settings_name_steq(name, "cfg", &next) || next) {
 		return -ENOENT;
 	}
-	if (len != sizeof(tmp)) {
+	if (len > sizeof(raw)) {
 		printk("[CFG] stored record rejected: %u bytes, expected %u\n",
 		       (unsigned)len, (unsigned)sizeof(tmp));
 		return 0;
 	}
 
-	n = read_cb(cb_arg, &tmp, sizeof(tmp));
-	if (n != (ssize_t)sizeof(tmp)) {
+	n = read_cb(cb_arg, raw, len);
+	if (n != (ssize_t)len) {
+		return 0;
+	}
+	if (!cfg_from_record(raw, len, &tmp)) {
+		printk("[CFG] stored record rejected: %u bytes, expected %u\n",
+		       (unsigned)len, (unsigned)sizeof(tmp));
 		return 0;
 	}
 	if (!cfg_record_ok(&tmp)) {
@@ -522,7 +587,7 @@ static int cfg_storage_load(void)
 }
 SYS_INIT(cfg_storage_load, APPLICATION, 0);
 
-#define CFG_CMD_MAX 400
+#define CFG_CMD_MAX 640
 
 static void scan_print(void);
 static void scan_restart(void);
@@ -532,6 +597,7 @@ static void peer_clear(void);
 static void peer_commit(const bt_addr_le_t *addr);
 static void mode_set(uint8_t m);
 static void sync_cmd(const char *a);
+static void single_cmd(const char *a);
 
 static char cfg_cmd[CFG_CMD_MAX];
 static volatile size_t cfg_cmd_len;
@@ -627,6 +693,25 @@ static void cfg_cmd_default(void)
 #define LINK_SYNC1_CFG 0x5B
 #define LINK_CFG_GRIP 0x01
 #define LINK_CFG_PROFILE 0x02
+#define LINK_CFG_SINGLE 0x03
+
+#define LINK_SYNC1_AUX 0x5C
+#define LINK_AUX_UP 0x0001
+#define LINK_AUX_DOWN 0x0002
+#define LINK_AUX_LEFT 0x0004
+#define LINK_AUX_RIGHT 0x0008
+#define LINK_AUX_DIRS 0x000F
+#define LINK_AUX_ACT 0x0010
+#define LINK_AUX_DEV 0x0020
+#define LINK_AUX_TYPING 0x0040
+
+#define LINK_SYNC1_KEYS 0x5D
+#define LINK_KEYS_LEN 10
+
+#define LINK_SYNC1_PUSH 0x5E
+
+#define LINK_SYNC1_AIM 0x5F
+#define LINK_AIM_LEN 7
 
 static volatile uint8_t link_cfg_pending, link_cfg_id, link_cfg_val;
 static volatile uint8_t link_rx_cfg_pending, link_rx_cfg_id, link_rx_cfg_val;
@@ -822,6 +907,8 @@ static void cfg_cmd_fn(struct k_work *w)
 			       grip_byte == 0x01 ? " (IN THE CHARGING GRIP,"
 						   " as a real one reports)" : "");
 		}
+	} else if (!strncmp(c, "single", 6)) {
+		single_cmd(c + 6);
 	} else if (!strncmp(c, "sync", 4)) {
 		sync_cmd(c + 4);
 	} else if (!strncmp(c, "peer", 4)) {
@@ -983,6 +1070,9 @@ static bool sync_key_down(void)
 	if (!sync_key.on || !sync_key.code || !jc_live()) {
 		return false;
 	}
+	if (sync_key.code >= SYNC_MOUSE) {
+		return false;
+	}
 	if ((kbd_mods & sync_key.mods) != sync_key.mods) {
 		return false;
 	}
@@ -994,12 +1084,11 @@ static bool sync_key_down(void)
 	return false;
 }
 #endif
-static uint16_t mouse_reports;
+static uint32_t mouse_reports;
 
 static uint8_t mouse_buttons;
-
-#if !defined(JC_LEFT)
 static int16_t mouse_dx, mouse_dy;
+
 #define RS_N 32
 
 struct rs_knot {
@@ -1019,6 +1108,8 @@ static struct k_spinlock rs_lock;
 #define MOUSE_GAIN_DEFAULT 250
 #define MOUSE_GAIN_MIN 10
 #define MOUSE_GAIN_MAX 1000
+#define LMOUSE_GAIN_DEFAULT 420
+#define LMOUSE_ACCEL_DEFAULT true
 static uint16_t mouse_gain = MOUSE_GAIN_DEFAULT;
 static int32_t mg_rem_x, mg_rem_y;
 
@@ -1191,11 +1282,11 @@ static void rs_emit(int16_t *ox, int16_t *oy)
 	*ox = (int16_t)dx;
 	*oy = (int16_t)dy;
 }
-#endif
-static bool mouse_has_moved;
 
-#if !defined(JC_LEFT)
+static bool mouse_has_moved;
+#define MOUSE_AIRBORNE_MS 3000
 static int8_t mouse_wheel;
+
 static uint16_t wheel_btn, wheel_btn_peer;
 static int64_t wheel_btn_until, wheel_btn_peer_until;
 
@@ -1214,6 +1305,8 @@ static uint16_t wheel_btn_peer_now(void)
 	}
 	return wheel_btn_peer;
 }
+
+static void push_tx_add(uint16_t mask, int8_t w);
 
 static void wheel_btn_feed(int8_t w)
 {
@@ -1234,12 +1327,113 @@ static void wheel_btn_feed(int8_t w)
 		} else if (CFG.btn[j].kind == JC_BTN_WPEER) {
 			wheel_btn_peer |= CFG.btn[j].mask;
 			wheel_btn_peer_until = until;
+		} else if (CFG.btn[j].kind == JC_BTN_WPSTICK) {
+			push_tx_add(CFG.btn[j].mask, w);
 		}
 	}
 }
-#endif
 
 static uint16_t peer_buttons;
+static uint16_t peer_aux;
+
+#if defined(JC_LEFT)
+static volatile uint32_t peer_kbd_at;
+
+static bool peer_kbd_here(void)
+{
+	uint32_t at = peer_kbd_at;
+
+	return at && (uint32_t)(k_uptime_get_32() - at) <= LINK_STALE_MS;
+}
+#else
+static struct k_spinlock rkbd_lock;
+static uint8_t rkbd_mods;
+static uint8_t rkbd_keys[6];
+static bool rkbd_on;
+#endif
+static K_SEM_DEFINE(link_wake, 0, 1);
+
+static inline bool jc_typing(void)
+{
+#if defined(JC_LEFT)
+	return jc_mode == JC_MODE_KEYBOARD;
+#else
+	return (peer_aux & LINK_AUX_TYPING) != 0;
+#endif
+}
+
+static uint8_t sync_mouse_bit(void)
+{
+	if (sync_key.code < SYNC_MOUSE || sync_key.code > SYNC_MOUSE + 7) {
+		return 0;
+	}
+	return (uint8_t)(1U << (sync_key.code - SYNC_MOUSE));
+}
+
+static bool sync_mouse_down(void)
+{
+	uint8_t b = sync_mouse_bit();
+
+	return b && sync_key.on && jc_live() && !jc_typing() &&
+	       (mouse_buttons & b) != 0;
+}
+
+static volatile uint16_t push_tx;
+
+static void push_tx_add(uint16_t mask, int8_t w)
+{
+	int8_t dx = (int8_t)(mask & 0xFF), dy = (int8_t)(mask >> 8);
+	uint8_t n = (uint8_t)((w < 0) ? -w : w);
+	uint16_t v = push_tx;
+	uint8_t at[2], na = 0;
+
+	if (n > 15) {
+		n = 15;
+	}
+	if (dy > 0) {
+		at[na++] = 0;
+	} else if (dy < 0) {
+		at[na++] = 4;
+	}
+	if (dx < 0) {
+		at[na++] = 8;
+	} else if (dx > 0) {
+		at[na++] = 12;
+	}
+	for (uint8_t i = 0; i < na; i++) {
+		uint16_t c = (uint16_t)(((v >> at[i]) + n) & 0xFu);
+
+		v = (uint16_t)((v & ~(0xFu << at[i])) | (c << at[i]));
+	}
+	if (v != push_tx) {
+		push_tx = v;
+		k_sem_give(&link_wake);
+	}
+}
+
+static struct k_spinlock push_lock;
+static int16_t push_in_x, push_in_y;
+
+static void peer_push_apply(int16_t *sx, int16_t *sy)
+{
+	const int32_t up = STICK_Y_UP_POSITIVE ? 1 : -1;
+	k_spinlock_key_t key = k_spin_lock(&push_lock);
+	int32_t nx = push_in_x, ny = push_in_y;
+	int32_t x, y;
+
+	push_in_x = 0;
+	push_in_y = 0;
+	k_spin_unlock(&push_lock, key);
+	if (!sx || !sy || (!nx && !ny)) {
+		return;
+	}
+	x = *sx + nx * (int32_t)CFG.stick_gain;
+	y = *sy + ny * up * (int32_t)CFG.stick_gain;
+	x = (x > STICK_THROW) ? STICK_THROW : (x < -STICK_THROW) ? -STICK_THROW : x;
+	y = (y > STICK_THROW) ? STICK_THROW : (y < -STICK_THROW) ? -STICK_THROW : y;
+	*sx = (int16_t)x;
+	*sy = (int16_t)y;
+}
 
 #if !defined(JC_LEFT)
 
@@ -1306,6 +1500,9 @@ static int32_t stick_vsx, stick_vsy;
 
 #define STICK_DZ_DEFAULT 290
 static int16_t stick_dz = STICK_DZ_DEFAULT;
+
+#define JM_GAIN_DEFAULT 32
+static int16_t jm_gain;
 
 struct mt_k {
 	int32_t ago;
@@ -1560,18 +1757,43 @@ static bool ptr_off(void)
 {
 	return stick_on() || gyro_mode_on();
 }
-
 #endif
 
 static void cfg_settings_apply(void)
 {
-#if !defined(JC_LEFT)
+#if defined(JC_LEFT)
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t mgain = LMOUSE_GAIN_DEFAULT;
+	bool accel = LMOUSE_ACCEL_DEFAULT;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		if (CFG.btn[j].kind != JC_BTN_SET) {
+			continue;
+		}
+		if (CFG.btn[j].code == JC_SET_MOUSE_GAIN) {
+			uint16_t v = CFG.btn[j].mask;
+
+			if (v >= MOUSE_GAIN_MIN && v <= MOUSE_GAIN_MAX) {
+				mgain = v;
+			}
+		} else if (CFG.btn[j].code == JC_SET_ACCEL) {
+			accel = (CFG.btn[j].mask != 0);
+		}
+	}
+	accel_on = accel;
+	if (mouse_gain != mgain) {
+		mouse_gain = mgain;
+		mg_rem_x = 0;
+		mg_rem_y = 0;
+	}
+#else
 	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
 	int16_t gain = STICK_MGAIN_DEFAULT;
 	uint16_t mgain = MOUSE_GAIN_DEFAULT;
 	bool accel = false;
 	int16_t dz = STICK_DZ_DEFAULT;
 	int16_t vg = STICK_VGAIN_DEFAULT;
+	int16_t gg = JM_GAIN_DEFAULT;
 
 	for (uint8_t j = 0; j < nb; j++) {
 		if (CFG.btn[j].kind != JC_BTN_SET) {
@@ -1599,12 +1821,17 @@ static void cfg_settings_apply(void)
 			if (CFG.btn[j].mask >= 1 && CFG.btn[j].mask <= 64) {
 				vg = (int16_t)CFG.btn[j].mask;
 			}
+		} else if (CFG.btn[j].code == JC_SET_GYRO_GAIN) {
+			if (CFG.btn[j].mask >= 1 && CFG.btn[j].mask <= 800) {
+				gg = (int16_t)CFG.btn[j].mask;
+			}
 		}
 	}
 	accel_on = accel;
 	stick_mgain = gain;
 	stick_dz = dz;
 	stick_vgain = vg;
+	jm_gain = gg;
 	if (mouse_gain != mgain) {
 		mouse_gain = mgain;
 		mg_rem_x = 0;
@@ -2138,6 +2365,19 @@ static bool hid_ready(void)
 	return g_mouse && sub_count && mouse_reports > 0;
 }
 
+static bool input_ready(void)
+{
+	if (single_follows()) {
+		return (peer_aux & LINK_AUX_DEV) != 0;
+	}
+#if defined(JC_LEFT)
+	if (peer_kbd_here()) {
+		return true;
+	}
+#endif
+	return hid_ready();
+}
+
 enum adv_mode { ADV_OFF, ADV_BONDED, ADV_PAIRABLE, ADV_WAKE };
 
 static int64_t wake_until;
@@ -2147,7 +2387,7 @@ static enum adv_mode adv_mode_wanted(void)
 	if (g_conn) {
 		return ADV_OFF;
 	}
-	if ((!console_bonded || pairable_until) && !hid_ready()) { return ADV_OFF; }
+	if ((!console_bonded || pairable_until) && !input_ready()) { return ADV_OFF; }
 	if (!console_bonded) {
 		return ADV_PAIRABLE;
 	}
@@ -2157,7 +2397,7 @@ static enum adv_mode adv_mode_wanted(void)
 	if (wake_until && k_uptime_get() < wake_until) {
 		return ADV_WAKE;
 	}
-	if (!hid_ready()) {
+	if (!input_ready()) {
 		return ADV_OFF;
 	}
 	return user_active ? ADV_BONDED : ADV_OFF;
@@ -2212,6 +2452,8 @@ static void arm_pairable_window(void)
 
 static void adv_work_handler(struct k_work *work);
 static K_WORK_DEFINE(adv_work, adv_work_handler);
+static void console_drop_fn(struct k_work *work);
+static K_WORK_DEFINE(console_drop_work, console_drop_fn);
 
 static void user_input_seen(void)
 {
@@ -2564,8 +2806,6 @@ static int32_t hm_get(const uint8_t *d, uint16_t len, uint16_t off,
 	return (int32_t)v;
 }
 
-#if defined(JC_LEFT)
-
 static bool hm_has_kbd(const struct hm_report *r)
 {
 	if (r->keys_n || r->bm_n) {
@@ -2573,6 +2813,20 @@ static bool hm_has_kbd(const struct hm_report *r)
 	}
 	for (uint8_t b = 0; b < 8; b++) {
 		if (r->mod_bit[b] != HM_NONE) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool hm_has_ptr(const struct hm_report *r)
+{
+	if ((r->x_off != HM_NONE && r->y_off != HM_NONE) ||
+	    r->wheel_off != HM_NONE) {
+		return true;
+	}
+	for (uint8_t b = 0; b < 8; b++) {
+		if (r->btn_bit[b] != HM_NONE) {
 			return true;
 		}
 	}
@@ -2620,6 +2874,7 @@ static bool hm_kbd_decode(const struct hm_report *r, const uint8_t *d,
 	return true;
 }
 
+#if defined(JC_LEFT)
 static bool kbd_decode_len(const uint8_t *d, uint16_t len, uint8_t *mods,
 			   uint8_t keys[6])
 {
@@ -2636,6 +2891,7 @@ static bool kbd_decode_len(const uint8_t *d, uint16_t len, uint8_t *mods,
 	memcpy(keys, d + key_off, 6);
 	return true;
 }
+#endif
 
 struct hm_kbd_src {
 	bool used;
@@ -2683,8 +2939,6 @@ static void hm_kbd_merge(const struct hm_kbd_src *src, uint8_t nsrc,
 	}
 }
 
-#else
-
 #define HM_XY 0x01
 #define HM_WHEEL 0x02
 #define HM_BTN 0x04
@@ -2723,6 +2977,7 @@ static uint8_t hm_mouse_decode(const struct hm_report *r, const uint8_t *d,
 	return have;
 }
 
+#if !defined(JC_LEFT)
 static bool mouse_decode_len(const uint8_t *d, uint16_t len, int16_t *x,
 			     int16_t *y, int8_t *wheel, uint8_t *btn)
 {
@@ -2776,8 +3031,31 @@ static uint8_t hm_keep_of[MAX_RPT];
 static uint8_t hm_keep_n;
 static bool hm_kept;
 static bool hm_map_whole;
-#if defined(JC_LEFT)
 static struct hm_kbd_src hm_kb[MAX_RPT];
+static bool hm_wait;
+
+#if !defined(JC_LEFT)
+static void rkbd_take(void)
+{
+	uint8_t mods, keys[6];
+	bool on = false, changed;
+	k_spinlock_key_t key;
+
+	for (uint8_t s = 0; s < MAX_RPT; s++) {
+		on = on || hm_kb[s].used;
+	}
+	hm_kbd_merge(hm_kb, MAX_RPT, &mods, keys);
+	key = k_spin_lock(&rkbd_lock);
+	changed = on != rkbd_on || mods != rkbd_mods ||
+		  memcmp(keys, rkbd_keys, 6) != 0;
+	rkbd_on = on;
+	rkbd_mods = mods;
+	memcpy(rkbd_keys, keys, 6);
+	k_spin_unlock(&rkbd_lock, key);
+	if (changed) {
+		k_sem_give(&link_wake);
+	}
+}
 #endif
 
 static void hm_reset(void)
@@ -2788,12 +3066,14 @@ static void hm_reset(void)
 	hm_ref_n = 0;
 	hm_rep_n = 0;
 	memset(hm_of_sub, HM_UNBOUND, sizeof(hm_of_sub));
-#if defined(JC_LEFT)
 	memset(hm_kb, 0, sizeof(hm_kb));
-#endif
+	hm_wait = false;
 	hm_sub_n = 0;
 	hm_kept = false;
 	hm_map_whole = false;
+#if !defined(JC_LEFT)
+	rkbd_take();
+#endif
 }
 
 static bool hm_keep_save(void)
@@ -2842,6 +3122,252 @@ static const struct hm_report *hm_layout(
 	return hm_bytes(r) == len ? r : NULL;
 }
 
+static int ptr_dump_put(char *s, int at, int cap, uint16_t off)
+{
+	char t[5];
+	int n = 0;
+
+	if (at + 7 > cap) {
+		return at;
+	}
+	s[at++] = ' ';
+	if (off == HM_NONE) {
+		s[at++] = '-';
+	} else {
+		do {
+			t[n++] = (char)('0' + off % 10U);
+			off /= 10U;
+		} while (off);
+		while (n) {
+			s[at++] = t[--n];
+		}
+	}
+	s[at] = '\0';
+	return at;
+}
+
+static void ptr_dump(void)
+{
+	static const char HEX[] = "0123456789ABCDEF";
+	const struct hm_report *lay[MAX_RPT];
+	uint16_t vh[MAX_RPT];
+	uint8_t n = 0;
+
+	if (g_mouse && hm_ready) {
+		for (uint8_t i = 0; i < sub_count && i < MAX_RPT; i++) {
+			if (hm_of_sub[i] == HM_UNBOUND ||
+			    !hm_has_ptr(&hm_rep[hm_of_sub[i]])) {
+				continue;
+			}
+			lay[n] = &hm_rep[hm_of_sub[i]];
+			vh[n++] = sub_params[i].value_handle;
+		}
+	} else if (g_mouse && hm_kept) {
+		for (uint8_t k = 0; k < hm_keep_n && k < MAX_RPT; k++) {
+			if (hm_keep_of[k] == HM_UNBOUND ||
+			    !hm_has_ptr(&hm_keep_rep[hm_keep_of[k]])) {
+				continue;
+			}
+			lay[n] = &hm_keep_rep[hm_keep_of[k]];
+			vh[n++] = hm_keep_vh[k];
+		}
+	} else {
+#if !defined(JC_LEFT)
+		if (g_mouse && !hm_wait) {
+			printk("[MAP] ptrs len\n");
+			return;
+		}
+#endif
+	}
+	printk("[MAP] ptrs %u\n", n);
+	for (uint8_t k = 0; k < n; k++) {
+		const struct hm_report *r = lay[k];
+		bool xy = r->x_off != HM_NONE && r->y_off != HM_NONE;
+		char s[112];
+		int at = 4;
+
+		s[0] = HEX[(vh[k] >> 12) & 15];
+		s[1] = HEX[(vh[k] >> 8) & 15];
+		s[2] = HEX[(vh[k] >> 4) & 15];
+		s[3] = HEX[vh[k] & 15];
+		s[4] = '\0';
+		at = ptr_dump_put(s, at, sizeof(s), hm_bytes(r));
+		at = ptr_dump_put(s, at, sizeof(s), xy ? r->x_off : HM_NONE);
+		at = ptr_dump_put(s, at, sizeof(s), xy ? r->x_size : 0);
+		at = ptr_dump_put(s, at, sizeof(s), xy ? r->y_off : HM_NONE);
+		at = ptr_dump_put(s, at, sizeof(s), xy ? r->y_size : 0);
+		at = ptr_dump_put(s, at, sizeof(s), r->wheel_off);
+		at = ptr_dump_put(s, at, sizeof(s),
+				  r->wheel_off != HM_NONE ? r->wheel_size : 0);
+		for (uint8_t b = 0; b < 8; b++) {
+			at = ptr_dump_put(s, at, sizeof(s), r->btn_bit[b]);
+		}
+		printk("[MAP] ptr %s\n", s);
+	}
+}
+
+#if defined(JC_LEFT)
+static void kbd_apply(uint8_t mods, const uint8_t keys[6])
+{
+	kbd_mods = mods;
+	for (int i = 0; i < 6; i++) {
+		kbd_keys[i] = keys[i];
+		if (kbd_keys[i]) {
+			user_input_seen();
+		}
+	}
+	if (kbd_mods) {
+		user_input_seen();
+	}
+
+	{
+		uint8_t want = mode_combo_wanted();
+
+		if (want && !mode_combo_held) {
+			uint8_t target = want - 1;
+
+			mode_set(jc_mode == target ? JC_MODE_JOYCON
+						   : target);
+			kbd_suppress = true;
+		}
+		mode_combo_held = (want != 0);
+	}
+
+	{
+		uint8_t want = prof_combo_wanted();
+
+		if (want && !prof_combo_held && want != prof_active) {
+			prof_load(want, true);
+			kbd_suppress = true;
+		}
+		prof_combo_held = (want != 0);
+	}
+
+	if (kbd_suppress && !kbd_mods && !kbd_keys[0] && !kbd_keys[1] &&
+	    !kbd_keys[2] && !kbd_keys[3] && !kbd_keys[4] && !kbd_keys[5]) {
+		kbd_suppress = false;
+	}
+
+	if (jc_mode == JC_MODE_KEYBOARD && !kbd_suppress) {
+		jc_usb_kbd_send(kbd_mods, kbd_keys);
+	}
+}
+
+#define KB_OWN 0
+#define KB_PEER 1
+static struct hm_kbd_src kb_from[2];
+
+static void kbd_from(uint8_t src, uint8_t mods, const uint8_t keys[6])
+{
+	uint8_t m, k[6];
+	bool any = mods != 0;
+
+	for (int i = 0; i < 6; i++) {
+		any = any || keys[i] != 0;
+	}
+	k_sched_lock();
+	if (any) {
+		kb_from[src].used = true;
+	}
+	kb_from[src].mods = mods;
+	memcpy(kb_from[src].keys, keys, 6);
+	hm_kbd_merge(kb_from, 2, &m, k);
+	kbd_apply(m, k);
+	k_sched_unlock();
+}
+
+static int64_t lmouse_used_until;
+
+static bool lmouse_aims(void)
+{
+	return jc_mode == JC_MODE_STICK || jc_mode == JC_MODE_GYRO;
+}
+
+static volatile uint32_t aim_tx;
+
+static void lmouse_apply(uint8_t have, int16_t x, int16_t y, int8_t wheel,
+			 uint8_t btn)
+{
+	if (have & HM_XY) {
+		mouse_dx += x;
+		mouse_dy += y;
+	}
+	if ((have & HM_XY) && (x || y) && lmouse_aims()) {
+		uint32_t v = aim_tx;
+		uint16_t ax = (uint16_t)((uint16_t)(v & 0xFFFF) + (uint16_t)x);
+		uint16_t ay = (uint16_t)((uint16_t)(v >> 16) + (uint16_t)y);
+
+		aim_tx = (uint32_t)ax | ((uint32_t)ay << 16);
+		k_sem_give(&link_wake);
+	}
+	if (have & HM_WHEEL) {
+		int16_t ww = (int16_t)(mouse_wheel + wheel);
+
+		mouse_wheel = ww > 127 ? 127 : ww < -127 ? -127 : (int8_t)ww;
+		wheel_btn_feed(wheel);
+		if (wheel) {
+			lmouse_used_until = k_uptime_get() + 200;
+		}
+	}
+	if ((have & HM_XY) && (x || y)) {
+		rs_push(x, y);
+		mouse_has_moved = true;
+		lmouse_used_until = k_uptime_get() + 200;
+		user_input_seen();
+	}
+	if (have & HM_BTN) {
+		mouse_buttons = btn;
+		if (btn) {
+			user_input_seen();
+		}
+	}
+}
+
+static uint16_t lmouse_mask(uint8_t kind)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t m = 0;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		if (CFG.btn[j].kind == kind &&
+		    (mouse_buttons & CFG.btn[j].code)) {
+			m |= CFG.btn[j].mask;
+		}
+	}
+	return m;
+}
+
+static int16_t lstick_x, lstick_y;
+
+static void lstick_wheel_push(void)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	int8_t w = mouse_wheel;
+	int32_t n = (w < 0) ? -(int32_t)w : w;
+	int32_t x = lstick_x, y = lstick_y;
+	int32_t push = n * (int32_t)CFG.stick_gain;
+	const int32_t up = STICK_Y_UP_POSITIVE ? 1 : -1;
+	uint8_t want = (w > 0) ? 1U : 2U;
+
+	if (!w) {
+		return;
+	}
+	mouse_wheel = (int8_t)(mouse_wheel - w);
+	for (uint8_t j = 0; j < nb; j++) {
+		if (CFG.btn[j].kind != JC_BTN_WSTICK || CFG.btn[j].code != want) {
+			continue;
+		}
+		x += (int8_t)(CFG.btn[j].mask & 0xFF) * push;
+		y += (int8_t)(CFG.btn[j].mask >> 8) * up * push;
+	}
+	x = (x > STICK_THROW) ? STICK_THROW : (x < -STICK_THROW) ? -STICK_THROW : x;
+	y = (y > STICK_THROW) ? STICK_THROW : (y < -STICK_THROW) ? -STICK_THROW : y;
+	lstick_x = (int16_t)x;
+	lstick_y = (int16_t)y;
+}
+
+#endif
+
 static uint8_t mouse_notify(struct bt_conn *conn,
 			    struct bt_gatt_subscribe_params *params,
 			    const void *data, uint16_t len)
@@ -2852,6 +3378,9 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		params->value_handle = 0;
 		return BT_GATT_ITER_STOP;
 	}
+	if (single_follows()) {
+		return BT_GATT_ITER_CONTINUE;
+	}
 	mouse_reports++;
 
 	{
@@ -2860,7 +3389,7 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		static uint16_t prev_handle;
 		uint16_t n = len > sizeof(prev) ? sizeof(prev) : len;
 
-		if (jc_mode != JC_MODE_KEYBOARD &&
+		if (!jc_typing() &&
 		    (n != prev_len || params->value_handle != prev_handle ||
 		     memcmp(prev, d, n) != 0)) {
 			memcpy(prev, d, n);
@@ -2881,7 +3410,15 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		uint8_t gmods = 0, gkeys[6] = { 0 };
 		bool by_len = kbd_decode_len(d, len, &gmods, gkeys);
 		bool by_map = lay && hm_kbd_decode(lay, d, len, &mods, keys);
+		int16_t px = 0, py = 0;
+		int8_t pw = 0;
+		uint8_t pb = 0;
+		uint8_t ptr = lay ?
+			      hm_mouse_decode(lay, d, len, &px, &py, &pw, &pb) : 0;
 
+		if (ptr) {
+			lmouse_apply(ptr, px, py, pw, pb);
+		}
 		if (lay) {
 			size_t src = (size_t)(params - sub_params);
 
@@ -2904,54 +3441,13 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 				hm_kbd_merge(hm_kb, MAX_RPT, &mods, keys);
 			}
 		} else {
-			if (!by_len) {
+			if (!by_len || hm_wait) {
 				return BT_GATT_ITER_CONTINUE;
 			}
 			mods = gmods;
 			memcpy(keys, gkeys, 6);
 		}
-		kbd_mods = mods;
-		for (int i = 0; i < 6; i++) {
-			kbd_keys[i] = keys[i];
-			if (kbd_keys[i]) {
-				user_input_seen();
-			}
-		}
-		if (kbd_mods) {
-			user_input_seen();
-		}
-
-		{
-			uint8_t want = mode_combo_wanted();
-
-			if (want && !mode_combo_held) {
-				uint8_t target = want - 1;
-
-				mode_set(jc_mode == target ? JC_MODE_JOYCON
-							   : target);
-				kbd_suppress = true;
-			}
-			mode_combo_held = (want != 0);
-		}
-
-		{
-			uint8_t want = prof_combo_wanted();
-
-			if (want && !prof_combo_held && want != prof_active) {
-				prof_load(want, true);
-				kbd_suppress = true;
-			}
-			prof_combo_held = (want != 0);
-		}
-
-		if (kbd_suppress && !kbd_mods && !kbd_keys[0] && !kbd_keys[1] &&
-		    !kbd_keys[2] && !kbd_keys[3] && !kbd_keys[4] && !kbd_keys[5]) {
-			kbd_suppress = false;
-		}
-
-		if (jc_mode == JC_MODE_KEYBOARD && !kbd_suppress) {
-			jc_usb_kbd_send(kbd_mods, kbd_keys);
-		}
+		kbd_from(KB_OWN, mods, keys);
 	}
 	return BT_GATT_ITER_CONTINUE;
 #else
@@ -2965,10 +3461,36 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 						     &btn) : 0;
 		bool trust = lay;
 		bool decoded;
+		uint8_t kmods = 0, kkeys[6] = { 0 };
+		bool kb = trust && hm_kbd_decode(lay, d, len, &kmods, kkeys);
 
+		if (kb) {
+			size_t src = (size_t)(params - sub_params);
+			bool any = kmods != 0;
+
+			for (int i = 0; i < 6; i++) {
+				any = any || kkeys[i] != 0;
+			}
+			if (src < MAX_RPT) {
+				if (any) {
+					hm_kb[src].used = true;
+				}
+				if (hm_kb[src].used) {
+					hm_kb[src].mods = kmods;
+					memcpy(hm_kb[src].keys, kkeys, 6);
+				}
+				rkbd_take();
+			}
+			if (any) {
+				user_input_seen();
+			}
+		}
 		if (trust) {
 			decoded = have != 0;
 		} else {
+			if (hm_wait) {
+				return BT_GATT_ITER_CONTINUE;
+			}
 			decoded = by_len;
 			x = gx;
 			y = gy;
@@ -3578,6 +4100,13 @@ static void scan_work_handler(struct k_work *work)
 	int err;
 
 	ARG_UNUSED(work);
+	if (single_follows()) {
+		if (scan_on) {
+			bt_le_scan_stop();
+			scan_on = false;
+		}
+		return;
+	}
 	if (g_mouse && !scan_forced()) {
 		return;
 	}
@@ -3592,6 +4121,84 @@ static void scan_work_handler(struct k_work *work)
 	}
 	scan_on = true;
 	scan_is_fast = fast;
+}
+
+static void single_drop_hid(void)
+{
+	struct bt_conn *c;
+
+	k_sched_lock();
+	c = g_mouse ? bt_conn_ref(g_mouse) : NULL;
+	k_sched_unlock();
+	if (c) {
+		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(c);
+	}
+}
+
+static void single_save(void)
+{
+	uint8_t rec[2] = { single_dev, single_gen };
+	settings_save_one("jc/single", rec, sizeof(rec));
+}
+
+static void single_apply(uint8_t v, uint8_t gen)
+{
+	single_dev = v;
+	single_gen = gen & 63;
+	if (single_follows()) {
+		k_work_cancel_delayable(&scan_work);
+		bt_le_scan_stop();
+		scan_on = false;
+		single_drop_hid();
+	} else {
+		k_work_schedule(&scan_work, K_NO_WAIT);
+	}
+	single_save();
+	k_work_submit(&adv_work);
+}
+
+static void single_change(uint8_t v)
+{
+	if (v == single_dev) {
+		return;
+	}
+	single_apply(v, (uint8_t)(single_gen + 1));
+	link_send_cfg(LINK_CFG_SINGLE, (uint8_t)((single_gen << 2) | single_dev));
+}
+
+static void single_heard(uint8_t val)
+{
+	uint8_t v = val & 3, gen = val >> 2;
+	uint8_t d = (uint8_t)((gen - single_gen) & 63);
+	bool take = d != 0 && d < 32;
+
+#if !defined(JC_LEFT)
+	take = take || (d == 0 && v != single_dev);
+#endif
+	if (v > SINGLE_MOUSE || !take) {
+		return;
+	}
+	if (v == single_dev) {
+		single_gen = gen;
+		single_save();
+		return;
+	}
+	single_apply(v, gen);
+}
+
+static void single_cmd(const char *a)
+{
+	while (*a == ' ' || *a == '\t') {
+		a++;
+	}
+	if (!strcmp(a, "off")) {
+		single_change(SINGLE_OFF);
+	} else if (!strcmp(a, "keyboard")) {
+		single_change(SINGLE_KBD);
+	} else if (!strcmp(a, "mouse")) {
+		single_change(SINGLE_MOUSE);
+	}
 }
 
 static void discover_next(struct bt_conn *conn, uint16_t type, uint16_t uuid16,
@@ -3626,6 +4233,8 @@ static void hm_done(void)
 	}
 	hm_sub_n = sub_count < MAX_RPT ? sub_count : MAX_RPT;
 	hm_ready = hm_rep_n > 0;
+	hm_wait = false;
+	ptr_dump();
 }
 
 static uint8_t hm_ref_cb(struct bt_conn *conn, uint8_t err,
@@ -3730,7 +4339,10 @@ static uint8_t discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 			rd_params.by_uuid.uuid = &hm_uuid_map.uuid;
 			rd_params.by_uuid.start_handle = hid_svc_start;
 			rd_params.by_uuid.end_handle = hid_svc_end;
-			bt_gatt_read(conn, &rd_params);
+			if (bt_gatt_read(conn, &rd_params)) {
+				hm_wait = false;
+				ptr_dump();
+			}
 
 			stage = DISC_BATT;
 			discover_next(conn, BT_GATT_DISCOVER_CHARACTERISTIC,
@@ -3834,6 +4446,8 @@ static void mouse_start_discovery(struct bt_conn *conn)
 	    !bt_addr_le_cmp(&hm_keep_addr, bt_conn_get_dst(conn))) {
 		hm_kept = true;
 	}
+	hm_wait = true;
+	ptr_dump();
 	sub_count = 0;
 	hid_svc_start = 0;
 	hid_svc_end = 0;
@@ -3849,14 +4463,103 @@ static int64_t peer_last_rx;
 
 static uint16_t link_pend;
 static uint8_t link_pend_n;
+static uint16_t link_aux_pend;
+static uint8_t link_aux_pend_n;
+#if defined(JC_LEFT)
+static struct k_spinlock pkeys_lock;
+static uint8_t pkeys[7];
+static uint8_t pkeys_pend[7];
+static uint8_t pkeys_pend_n;
+static bool pkeys_new;
+#endif
+static uint16_t push_rx_last, push_pend;
+static uint8_t push_pend_n;
+static bool push_rx_ok;
+static int64_t push_rx_at;
+
+static void push_in_add(uint16_t v, uint16_t was)
+{
+	int32_t d[4], x, y;
+	bool any = false;
+	k_spinlock_key_t key;
+
+	for (int k = 0; k < 4; k++) {
+		d[k] = (int32_t)((((v >> (4 * k)) & 0xF) -
+				  ((was >> (4 * k)) & 0xF)) & 0xF);
+		any = any || d[k] != 0;
+	}
+	if (!any) {
+		return;
+	}
+	key = k_spin_lock(&push_lock);
+	y = push_in_y + d[0] - d[1];
+	x = push_in_x + d[3] - d[2];
+	push_in_y = (int16_t)((y > 64) ? 64 : (y < -64) ? -64 : y);
+	push_in_x = (int16_t)((x > 64) ? 64 : (x < -64) ? -64 : x);
+	k_spin_unlock(&push_lock, key);
+	user_input_seen();
+}
+
+#if !defined(JC_LEFT)
+static struct k_spinlock aim_lock;
+static int32_t aim_in_x, aim_in_y;
+static uint32_t aim_rx_last, aim_pend;
+static uint8_t aim_pend_n;
+static bool aim_rx_ok;
+static int64_t aim_rx_at;
+
+static void aim_heard(uint32_t v)
+{
+	int64_t now = k_uptime_get();
+
+	if (aim_rx_ok && now - aim_rx_at > LINK_STALE_MS) {
+		aim_rx_ok = false;
+	}
+	aim_rx_at = now;
+	if (v == aim_rx_last) {
+		aim_pend_n = 0;
+		aim_rx_ok = true;
+		return;
+	}
+	if (v != aim_pend) {
+		aim_pend = v;
+		aim_pend_n = 1;
+		return;
+	}
+	if (++aim_pend_n < 2) {
+		return;
+	}
+	if (aim_rx_ok) {
+		int16_t dx = (int16_t)(uint16_t)((v & 0xFFFFu) -
+						 (aim_rx_last & 0xFFFFu));
+		int16_t dy = (int16_t)(uint16_t)((v >> 16) - (aim_rx_last >> 16));
+		k_spinlock_key_t key = k_spin_lock(&aim_lock);
+		int32_t x = aim_in_x + dx, y = aim_in_y + dy;
+
+		aim_in_x = (x > 32767) ? 32767 : (x < -32768) ? -32768 : x;
+		aim_in_y = (y > 32767) ? 32767 : (y < -32768) ? -32768 : y;
+		k_spin_unlock(&aim_lock, key);
+		k_sem_give(&link_wake);
+	}
+	aim_rx_last = v;
+	aim_rx_ok = true;
+	aim_pend_n = 0;
+}
+#endif
 
 static uint32_t link_rx_p10;
 
 struct link_port {
-	uint8_t f[LINK_LEN];
+	uint8_t f[LINK_KEYS_LEN];
 	int n;
 	uint32_t *bytes;
 };
+
+static inline int link_len_of(uint8_t sync1)
+{
+	return sync1 == LINK_SYNC1_KEYS ? LINK_KEYS_LEN :
+	       sync1 == LINK_SYNC1_AIM ? LINK_AIM_LEN : LINK_LEN;
+}
 
 static struct link_port link_p10;
 
@@ -3877,15 +4580,64 @@ static void link_isr(const struct device *dev, void *user_data)
 		if (n == 0 && ch != LINK_SYNC0) {
 			continue;
 		}
-		if (n == 1 && ch != LINK_SYNC1 && ch != LINK_SYNC1_CFG) {
+		if (n == 1 && ch != LINK_SYNC1 && ch != LINK_SYNC1_CFG &&
+		    ch != LINK_SYNC1_AUX && ch != LINK_SYNC1_KEYS &&
+		    ch != LINK_SYNC1_PUSH && ch != LINK_SYNC1_AIM) {
 			n = (ch == LINK_SYNC0) ? 1 : 0;
 			continue;
 		}
 		f[n++] = ch;
-		if (n < LINK_LEN) {
+		if (n < LINK_LEN || n < link_len_of(f[1])) {
 			continue;
 		}
 		n = 0;
+		if (f[1] == LINK_SYNC1_AIM) {
+			if (crc8(f, LINK_AIM_LEN - 1, 0x07, 0x00, false) !=
+			    f[LINK_AIM_LEN - 1]) {
+				continue;
+			}
+			peer_last_rx = k_uptime_get();
+#if !defined(JC_LEFT)
+			aim_heard((uint32_t)f[2] | ((uint32_t)f[3] << 8) |
+				  ((uint32_t)f[4] << 16) |
+				  ((uint32_t)f[5] << 24));
+#endif
+			continue;
+		}
+		if (f[1] == LINK_SYNC1_KEYS) {
+			if (crc8(f, LINK_KEYS_LEN - 1, 0x07, 0x00, false) !=
+			    f[LINK_KEYS_LEN - 1]) {
+				continue;
+			}
+			peer_last_rx = k_uptime_get();
+#if defined(JC_LEFT)
+			{
+				k_spinlock_key_t key = k_spin_lock(&pkeys_lock);
+				uint32_t at = k_uptime_get_32();
+				bool fresh = false;
+
+				peer_kbd_at = at ? at : 1;
+				if (!memcmp(f + 2, pkeys, 7)) {
+					pkeys_pend_n = 0;
+				} else if (!memcmp(f + 2, pkeys_pend, 7)) {
+					if (++pkeys_pend_n >= 2) {
+						memcpy(pkeys, f + 2, 7);
+						pkeys_pend_n = 0;
+						pkeys_new = true;
+						fresh = true;
+					}
+				} else {
+					memcpy(pkeys_pend, f + 2, 7);
+					pkeys_pend_n = 1;
+				}
+				k_spin_unlock(&pkeys_lock, key);
+				if (fresh) {
+					k_sem_give(&link_wake);
+				}
+			}
+#endif
+			continue;
+		}
 		if (crc8(f, LINK_LEN - 1, 0x07, 0x00, false) != f[LINK_LEN - 1]) {
 			continue;
 		}
@@ -3894,6 +4646,54 @@ static void link_isr(const struct device *dev, void *user_data)
 			link_rx_cfg_val = f[3];
 			link_rx_cfg_pending = 1;
 			peer_last_rx = k_uptime_get();
+			continue;
+		}
+		if (f[1] == LINK_SYNC1_PUSH) {
+			uint16_t v = f[2] | ((uint16_t)f[3] << 8);
+			int64_t now = k_uptime_get();
+
+			if (push_rx_ok && now - push_rx_at > LINK_STALE_MS) {
+				push_rx_ok = false;
+			}
+			push_rx_at = now;
+			peer_last_rx = now;
+			if (v == push_rx_last) {
+				push_pend_n = 0;
+				push_rx_ok = true;
+			} else if (v == push_pend) {
+				if (++push_pend_n >= 2) {
+					if (push_rx_ok) {
+						push_in_add(v, push_rx_last);
+					}
+					push_rx_last = v;
+					push_rx_ok = true;
+					push_pend_n = 0;
+				}
+			} else {
+				push_pend = v;
+				push_pend_n = 1;
+			}
+			continue;
+		}
+		if (f[1] == LINK_SYNC1_AUX) {
+			uint16_t v = f[2] | ((uint16_t)f[3] << 8);
+
+			if (v == peer_aux) {
+				link_aux_pend_n = 0;
+			} else if (v == link_aux_pend) {
+				if (++link_aux_pend_n >= 2) {
+					peer_aux = v;
+					link_aux_pend_n = 0;
+				}
+			} else {
+				link_aux_pend = v;
+				link_aux_pend_n = 1;
+			}
+			peer_last_rx = k_uptime_get();
+			if ((peer_aux & LINK_AUX_DIRS) ||
+			    ((peer_aux & LINK_AUX_ACT) && single_follows())) {
+				user_input_seen();
+			}
 			continue;
 		}
 		{
@@ -3917,6 +4717,34 @@ static void link_isr(const struct device *dev, void *user_data)
 		}
 	}
 	p->n = n;
+}
+
+static uint16_t mpstick_dirs(void)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t a = 0;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		int8_t dx, dy;
+
+		if (CFG.btn[j].kind != JC_BTN_MPSTICK ||
+		    !(mouse_buttons & CFG.btn[j].code)) {
+			continue;
+		}
+		dx = (int8_t)(CFG.btn[j].mask & 0xFF);
+		dy = (int8_t)(CFG.btn[j].mask >> 8);
+		if (dy > 0) {
+			a |= LINK_AUX_UP;
+		} else if (dy < 0) {
+			a |= LINK_AUX_DOWN;
+		}
+		if (dx < 0) {
+			a |= LINK_AUX_LEFT;
+		} else if (dx > 0) {
+			a |= LINK_AUX_RIGHT;
+		}
+	}
+	return a;
 }
 
 #if defined(JC_LEFT)
@@ -3955,14 +4783,14 @@ static uint16_t cfg_mask_for(uint8_t kind)
 
 static uint16_t link_tx_buttons(void)
 {
-	uint16_t m;
+	uint16_t m = lmouse_mask(JC_BTN_MPEER) | wheel_btn_peer_now();
 
 	if (!jc_live()) {
-		return 0;
+		return m;
 	}
-	m = cfg_mask_for(JC_BTN_PEER) | cfg_mask_for(JC_BTN_PEERMOD);
+	m |= cfg_mask_for(JC_BTN_PEER) | cfg_mask_for(JC_BTN_PEERMOD);
 
-	if (sync_key_down()) {
+	if (sync_key_down() || sync_mouse_down()) {
 		m |= LINK_SYNC_REQ;
 	}
 	if (jc_mode == JC_MODE_STICK) {
@@ -3972,6 +4800,57 @@ static uint16_t link_tx_buttons(void)
 		m |= LINK_GYRO;
 	}
 	return m;
+}
+
+static uint16_t link_tx_aux(void)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t a = 0;
+
+	if (hid_ready()) {
+		a |= LINK_AUX_DEV;
+	}
+	if (jc_typing()) {
+		a |= LINK_AUX_TYPING;
+	}
+	if (kbd_mods) {
+		a |= LINK_AUX_ACT;
+	}
+	for (int i = 0; i < 6; i++) {
+		if (kbd_keys[i]) {
+			a |= LINK_AUX_ACT;
+		}
+	}
+	if (mouse_buttons || k_uptime_get() < lmouse_used_until) {
+		a |= LINK_AUX_ACT;
+	}
+	a |= mpstick_dirs();
+	for (uint8_t j = 0; jc_live() && j < nb; j++) {
+		int8_t dx, dy;
+
+		if (CFG.btn[j].kind != JC_BTN_PSTICK) {
+			continue;
+		}
+		for (int i = 0; i < 6; i++) {
+			if (!kbd_keys[i] || kbd_keys[i] != CFG.btn[j].code) {
+				continue;
+			}
+			dx = (int8_t)(CFG.btn[j].mask & 0xFF);
+			dy = (int8_t)(CFG.btn[j].mask >> 8);
+			if (dy > 0) {
+				a |= LINK_AUX_UP;
+			} else if (dy < 0) {
+				a |= LINK_AUX_DOWN;
+			}
+			if (dx < 0) {
+				a |= LINK_AUX_LEFT;
+			} else if (dx > 0) {
+				a |= LINK_AUX_RIGHT;
+			}
+			break;
+		}
+	}
+	return a;
 }
 
 #else
@@ -3990,7 +4869,29 @@ static uint16_t link_tx_buttons(void)
 		}
 	}
 	m |= wheel_btn_peer_now();
+	if (sync_mouse_down()) {
+		m |= LINK_SYNC_REQ;
+	}
 	return m;
+}
+
+static uint16_t link_tx_aux(void)
+{
+	static int64_t used_until;
+	int64_t now = k_uptime_get();
+	uint16_t a = 0;
+
+	if (hid_ready()) {
+		a |= LINK_AUX_DEV;
+	}
+	if (mouse_buttons || mouse_dx || mouse_dy || mouse_wheel) {
+		used_until = now + 200;
+	}
+	if (now < used_until) {
+		a |= LINK_AUX_ACT;
+	}
+	a |= mpstick_dirs();
+	return a;
 }
 
 static void stick_drive(uint8_t src, int16_t *axis)
@@ -4022,6 +4923,184 @@ static void stick_drive(uint8_t src, int16_t *axis)
 	}
 	*axis = (int16_t)d;
 }
+
+static void stick_wheel_push(void)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	int32_t w = mouse_wheel, n = (w < 0) ? -w : w;
+	int32_t x = stick_x, y = stick_y;
+	int32_t push = n * (int32_t)CFG.stick_gain;
+	const int32_t up = STICK_Y_UP_POSITIVE ? 1 : -1;
+	uint8_t want = (w > 0) ? 1U : 2U;
+	bool any = false;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		if (CFG.btn[j].kind != JC_BTN_WSTICK) {
+			continue;
+		}
+		any = true;
+		if (!w || CFG.btn[j].code != want) {
+			continue;
+		}
+		x += (int8_t)(CFG.btn[j].mask & 0xFF) * push;
+		y += (int8_t)(CFG.btn[j].mask >> 8) * up * push;
+	}
+	if (!any || !w) {
+		return;
+	}
+	mouse_wheel = 0;
+	x = (x > STICK_THROW) ? STICK_THROW : (x < -STICK_THROW) ? -STICK_THROW : x;
+	y = (y > STICK_THROW) ? STICK_THROW : (y < -STICK_THROW) ? -STICK_THROW : y;
+	stick_x = (int16_t)x;
+	stick_y = (int16_t)y;
+}
+
+static void stick_held(int8_t *hx, int8_t *hy)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t a = peer_aux;
+	int x = 0, y = 0;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		if (CFG.btn[j].kind != JC_BTN_MSTICK ||
+		    !(mouse_buttons & CFG.btn[j].code)) {
+			continue;
+		}
+		x += (int8_t)(CFG.btn[j].mask & 0xFF);
+		y += (int8_t)(CFG.btn[j].mask >> 8);
+	}
+	if (a & LINK_AUX_UP) {
+		y++;
+	}
+	if (a & LINK_AUX_DOWN) {
+		y--;
+	}
+	if (a & LINK_AUX_LEFT) {
+		x--;
+	}
+	if (a & LINK_AUX_RIGHT) {
+		x++;
+	}
+	*hx = (int8_t)((x > 0) - (x < 0));
+	*hy = (int8_t)((y > 0) - (y < 0));
+}
+#endif
+
+#if defined(JC_LEFT)
+static void link_rx_keys(void)
+{
+	static bool was_here;
+	bool here = peer_kbd_here();
+	bool fresh;
+	uint8_t s[7];
+	k_spinlock_key_t key = k_spin_lock(&pkeys_lock);
+
+	if (!here) {
+		static const uint8_t none[7];
+
+		if (memcmp(pkeys, none, 7)) {
+			memset(pkeys, 0, 7);
+			pkeys_new = true;
+		}
+		pkeys_pend_n = 0;
+	}
+	fresh = pkeys_new;
+	pkeys_new = false;
+	memcpy(s, pkeys, 7);
+	k_spin_unlock(&pkeys_lock, key);
+	if (fresh) {
+		kbd_from(KB_PEER, s[0], s + 1);
+	}
+	if (here != was_here) {
+		was_here = here;
+		k_work_submit(&adv_work);
+		if (!here && g_conn) {
+			k_work_submit(&console_drop_work);
+		}
+	}
+}
+
+static void link_tx_aim(int64_t now)
+{
+	static uint32_t last;
+	static int64_t last_at;
+	uint32_t v = aim_tx;
+	uint8_t f[LINK_AIM_LEN] = {
+		LINK_SYNC0, LINK_SYNC1_AIM,
+		(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
+		(uint8_t)(v >> 24), 0
+	};
+	int copies;
+
+	if (v == last && now - last_at < 100) {
+		return;
+	}
+	copies = (v != last) ? 2 : 1;
+	f[LINK_AIM_LEN - 1] = crc8(f, LINK_AIM_LEN - 1, 0x07, 0x00, false);
+	while (copies--) {
+		for (int i = 0; i < LINK_AIM_LEN; i++) {
+			uart_poll_out(link_uart, f[i]);
+		}
+	}
+	last = v;
+	last_at = now;
+}
+#else
+static void link_rx_aim(void)
+{
+	int32_t dx, dy, x, y;
+	k_spinlock_key_t key = k_spin_lock(&aim_lock);
+
+	dx = aim_in_x;
+	dy = aim_in_y;
+	aim_in_x = 0;
+	aim_in_y = 0;
+	k_spin_unlock(&aim_lock, key);
+	if ((!dx && !dy) || !ptr_off()) {
+		return;
+	}
+	k_sched_lock();
+	x = mouse_dx + dx;
+	y = mouse_dy + dy;
+	mouse_dx = (int16_t)((x > 32767) ? 32767 : (x < -32768) ? -32768 : x);
+	mouse_dy = (int16_t)((y > 32767) ? 32767 : (y < -32768) ? -32768 : y);
+	k_sched_unlock();
+	rs_push((int16_t)dx, (int16_t)dy);
+	user_input_seen();
+}
+
+static void link_tx_keys(int64_t now)
+{
+	static uint8_t last[7];
+	static int64_t last_at;
+	uint8_t f[LINK_KEYS_LEN];
+	bool on, changed;
+	int copies;
+	k_spinlock_key_t key = k_spin_lock(&rkbd_lock);
+
+	on = rkbd_on && !single_follows();
+	f[2] = rkbd_mods;
+	memcpy(f + 3, rkbd_keys, 6);
+	k_spin_unlock(&rkbd_lock, key);
+	if (!on) {
+		memset(f + 2, 0, 7);
+	}
+	changed = memcmp(f + 2, last, 7) != 0;
+	if (!changed && (!on || now - last_at < 100)) {
+		return;
+	}
+	f[0] = LINK_SYNC0;
+	f[1] = LINK_SYNC1_KEYS;
+	f[LINK_KEYS_LEN - 1] = crc8(f, LINK_KEYS_LEN - 1, 0x07, 0x00, false);
+	copies = changed ? 3 : 1;
+	while (copies--) {
+		for (int i = 0; i < LINK_KEYS_LEN; i++) {
+			uart_poll_out(link_uart, f[i]);
+		}
+	}
+	memcpy(last, f + 2, 7);
+	last_at = now;
+}
 #endif
 
 static void link_thread(void *a, void *b, void *c)
@@ -4031,6 +5110,10 @@ static void link_thread(void *a, void *b, void *c)
 #if defined(JC_LEFT)
 	int64_t last_prof_tx = 0;
 #endif
+	uint16_t last_tx_aux = 0xFFFF, last_rx_aux = 0;
+	int64_t last_aux_tx = 0, last_single_tx = 0;
+	uint16_t last_tx_push = 0;
+	int64_t last_push_tx = 0;
 
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	if (!device_is_ready(link_uart)) {
@@ -4042,8 +5125,20 @@ static void link_thread(void *a, void *b, void *c)
 	uart_irq_rx_enable(link_uart);
 
 	while (1) {
-		uint16_t m = link_tx_buttons();
-		int64_t now = k_uptime_get();
+		uint16_t m;
+		int64_t now;
+
+#if defined(JC_LEFT)
+		link_rx_keys();
+#endif
+		m = link_tx_buttons();
+		now = k_uptime_get();
+#if defined(JC_LEFT)
+		link_tx_aim(now);
+#else
+		link_tx_keys(now);
+		link_rx_aim();
+#endif
 
 		if (link_rx_cfg_pending) {
 			uint8_t id = link_rx_cfg_id, val = link_rx_cfg_val;
@@ -4062,6 +5157,8 @@ static void link_thread(void *a, void *b, void *c)
 					settings_save_one("jc/grip", &on,
 							  sizeof(on));
 				}
+			} else if (id == LINK_CFG_SINGLE) {
+				single_heard(val);
 			}
 		}
 
@@ -4098,6 +5195,61 @@ static void link_thread(void *a, void *b, void *c)
 			last_tx = now;
 		}
 
+		{
+			uint16_t a = link_tx_aux();
+
+			if (a != last_tx_aux || (now - last_aux_tx) >= 100) {
+				uint8_t f[LINK_LEN] = {
+					LINK_SYNC0, LINK_SYNC1_AUX,
+					(uint8_t)(a & 0xFF), (uint8_t)(a >> 8), 0
+				};
+				int copies = (a != last_tx_aux) ? 3 : 1;
+
+				f[4] = crc8(f, LINK_LEN - 1, 0x07, 0x00, false);
+				while (copies--) {
+					for (int i = 0; i < LINK_LEN; i++) {
+						uart_poll_out(link_uart, f[i]);
+					}
+				}
+				last_tx_aux = a;
+				last_aux_tx = now;
+			}
+		}
+
+		{
+			uint16_t p = push_tx;
+
+			if (p != last_tx_push || (now - last_push_tx) >= 100) {
+				uint8_t f[LINK_LEN] = {
+					LINK_SYNC0, LINK_SYNC1_PUSH,
+					(uint8_t)(p & 0xFF), (uint8_t)(p >> 8), 0
+				};
+				int copies = (p != last_tx_push) ? 3 : 1;
+
+				f[4] = crc8(f, LINK_LEN - 1, 0x07, 0x00, false);
+				while (copies--) {
+					for (int i = 0; i < LINK_LEN; i++) {
+						uart_poll_out(link_uart, f[i]);
+					}
+				}
+				last_tx_push = p;
+				last_push_tx = now;
+			}
+		}
+
+		if ((now - last_single_tx) >= 2000) {
+			uint8_t g[LINK_LEN] = {
+				LINK_SYNC0, LINK_SYNC1_CFG, LINK_CFG_SINGLE,
+				(uint8_t)((single_gen << 2) | single_dev), 0
+			};
+
+			last_single_tx = now;
+			g[4] = crc8(g, LINK_LEN - 1, 0x07, 0x00, false);
+			for (int i = 0; i < LINK_LEN; i++) {
+				uart_poll_out(link_uart, g[i]);
+			}
+		}
+
 #if defined(JC_LEFT)
 		if (prof_active && (now - last_prof_tx) >= 2000) {
 			uint8_t g[LINK_LEN] = {
@@ -4117,7 +5269,20 @@ static void link_thread(void *a, void *b, void *c)
 		    (k_uptime_get() - peer_last_rx) > LINK_STALE_MS) {
 			peer_buttons = 0;
 		}
-		k_msleep(10);
+		if (peer_aux && peer_last_rx &&
+		    (k_uptime_get() - peer_last_rx) > LINK_STALE_MS) {
+			peer_aux = 0;
+		}
+		if (((peer_aux ^ last_rx_aux) & LINK_AUX_DEV) && single_follows()) {
+			bool dev = (peer_aux & LINK_AUX_DEV) != 0;
+
+			k_work_submit(&adv_work);
+			if (!dev && g_conn) {
+				k_work_submit(&console_drop_work);
+			}
+		}
+		last_rx_aux = peer_aux;
+		k_sem_take(&link_wake, K_MSEC(10));
 	}
 }
 
@@ -4249,7 +5414,7 @@ static int32_t jm_t[4];
 static int32_t jm_up0[3];
 static uint32_t jm_ms;
 static bool jm_live;
-static const int16_t jm_gain = 32;
+static int16_t jm_gain = JM_GAIN_DEFAULT;
 
 static uint32_t jm_get(const uint8_t *r, uint16_t bit, uint8_t w)
 {
@@ -4428,6 +5593,24 @@ static void jm_reset(void)
 	jm_live = false;
 }
 
+static void jm_room(const int32_t up[3], uint32_t dms, int64_t *hi, int64_t *lo)
+{
+	int64_t stop = (int64_t)JM_TILT_STOP * (JM_ONE / 1000);
+
+	*hi = 32767;
+	*lo = 32767;
+	if (up[2] > 0) {
+		int64_t den = (int64_t)up[2] * dms;
+
+		*hi = (stop > up[1]) ? (stop - up[1]) * 3603604 / den : 0;
+		*lo = (stop > -up[1]) ? (stop + up[1]) * 3603604 / den : 0;
+	} else if (up[1] > 0) {
+		*hi = 0;
+	} else {
+		*lo = 0;
+	}
+}
+
 static void jm_apply(uint8_t *r, int32_t vx, int32_t vy)
 {
 	uint32_t now = k_uptime_get_32();
@@ -4474,22 +5657,10 @@ static void jm_apply(uint8_t *r, int32_t vx, int32_t vy)
 		lr = lr * 32000 / big;
 		ud = ud * 32000 / big;
 	}
-	{
-		int64_t stop = (int64_t)JM_TILT_STOP * (JM_ONE / 1000);
-		int64_t hi = 32767, lo = 32767;
+	int64_t hi, lo;
 
-		if (up[2] > 0) {
-			int64_t den = (int64_t)up[2] * dms;
-
-			hi = (stop > up[1]) ? (stop - up[1]) * 3603604 / den : 0;
-			lo = (stop > -up[1]) ? (stop + up[1]) * 3603604 / den : 0;
-		} else if (up[1] > 0) {
-			hi = 0;
-		} else {
-			lo = 0;
-		}
-		ud = (ud > hi) ? hi : (ud < -lo) ? -lo : ud;
-	}
+	jm_room(up, dms, &hi, &lo);
+	ud = (ud > hi) ? hi : (ud < -lo) ? -lo : ud;
 
 	memcpy(was, jm_t, sizeof(was));
 	h[0] = (int32_t)((ud * dms * JM_HALF_NUM) / JM_HALF_DEN);
@@ -4683,7 +5854,7 @@ static void send_report(void)
 		asked_slower = true;
 	}
 
-	if (!mouse_has_moved) {
+	if (!mouse_has_moved || since < MOUSE_AIRBORNE_MS) {
 		r[0x0D] = 0xFF;
 	}
 
@@ -4693,6 +5864,7 @@ static void send_report(void)
 	}
 
 	buttons |= peer_buttons & ~(LINK_SYNC_REQ | LINK_STICK | LINK_GYRO);
+	buttons |= lmouse_mask(JC_BTN_MOUSE) | wheel_btn_now();
 	r[0x02] = buttons & 0xFF;
 	r[0x03] = buttons >> 8;
 	if (grip_byte >= 0) {
@@ -4730,12 +5902,74 @@ static void send_report(void)
 				}
 			}
 		}
+		for (uint8_t j = 0; j < nb; j++) {
+			if (CFG.btn[j].kind != JC_BTN_MSTICK ||
+			    !(mouse_buttons & CFG.btn[j].code)) {
+				continue;
+			}
+			sx += (int8_t)(CFG.btn[j].mask & 0xFF) * STICK_THROW;
+			sy += (int8_t)(CFG.btn[j].mask >> 8) * up;
+		}
+		if (peer_aux & LINK_AUX_UP) {
+			sy += up;
+		}
+		if (peer_aux & LINK_AUX_DOWN) {
+			sy -= up;
+		}
+		if (peer_aux & LINK_AUX_LEFT) {
+			sx -= STICK_THROW;
+		}
+		if (peer_aux & LINK_AUX_RIGHT) {
+			sx += STICK_THROW;
+		}
+		lstick_wheel_push();
+		peer_push_apply(&lstick_x, &lstick_y);
+		sx += lstick_x;
+		sy += lstick_y;
+		lstick_x = (int16_t)((int32_t)lstick_x * STICK_DECAY_NUM
+				     / STICK_DECAY_DEN);
+		lstick_y = (int16_t)((int32_t)lstick_y * STICK_DECAY_NUM
+				     / STICK_DECAY_DEN);
 		if (sx < 0) { sx = 0; } else if (sx > 4095) { sx = 4095; }
 		if (sy < 0) { sy = 0; } else if (sy > 4095) { sy = 4095; }
 		packed = ((uint32_t)sx & 0xFFF) | (((uint32_t)sy & 0xFFF) << 12);
 		r[0x05] = (uint8_t)(packed & 0xFF);
 		r[0x06] = (uint8_t)((packed >> 8) & 0xFF);
 		r[0x07] = (uint8_t)((packed >> 16) & 0xFF);
+	}
+
+	{
+		int32_t dx_all = mouse_dx;
+		int32_t dy_all = mouse_dy;
+		int16_t rs_wx = 0, rs_wy = 0;
+		int16_t wx, wy;
+
+		mouse_dx -= dx_all;
+		mouse_dy -= dy_all;
+		rs_emit(&rs_wx, &rs_wy);
+		wx = rs_wx;
+		wy = rs_wy;
+		if (lmouse_aims()) {
+			wx = 0;
+			wy = 0;
+			mg_rem_x = 0;
+			mg_rem_y = 0;
+		} else {
+			mouse_gain_apply(&wx, &wy);
+		}
+		r[0x09] = wx & 0xFF;
+		r[0x0A] = (wx >> 8) & 0xFF;
+		r[0x0B] = wy & 0xFF;
+		r[0x0C] = (wy >> 8) & 0xFF;
+		if (mouse_has_moved && since >= MOUSE_AIRBORNE_MS &&
+		    !lmouse_aims()) {
+			static uint8_t desk_at;
+
+			memcpy(r + 0x0E, LEFT_DESK[desk_at], LEFT_DESK_LEN);
+			r[0x0D] = LEFT_DESK_SURF[desk_at];
+			desk_at = (uint8_t)((desk_at + 1U) %
+					    LEFT_DESK_FRAMES);
+		}
 	}
 #else
 	{
@@ -4778,10 +6012,13 @@ static void send_report(void)
 		uint32_t packed;
 
 		if (stick_on()) {
+			peer_push_apply(NULL, NULL);
 			stick_mouse_in();
 		} else {
 			stick_drive(CFG.stick_src_x, &stick_x);
 			stick_drive(CFG.stick_src_y, &stick_y);
+			stick_wheel_push();
+			peer_push_apply(&stick_x, &stick_y);
 			stick_fx = (int32_t)stick_x * 16;
 			stick_fy = (int32_t)stick_y * 16;
 			stick_ex = stick_fx;
@@ -4800,6 +6037,17 @@ static void send_report(void)
 		} else {
 			sx = STICK_CX + stick_x;
 			sy = STICK_CY + stick_y;
+		}
+		{
+			int8_t hx, hy;
+
+			stick_held(&hx, &hy);
+			if (hx) {
+				sx = STICK_MCX + (hx > 0 ? STICK_RANGE_XP : -STICK_RANGE_XN);
+			}
+			if (hy) {
+				sy = STICK_MCY + (hy > 0 ? STICK_RANGE_YP : -STICK_RANGE_YN);
+			}
 		}
 		if (sx < 0) { sx = 0; } else if (sx > 4095) { sx = 4095; }
 		if (sy < 0) { sy = 0; } else if (sy > 4095) { sy = 4095; }
@@ -4829,22 +6077,24 @@ static void send_report(void)
 		if (ptr_off()) {
 			r[0x0D] = 0xFF;
 		}
-		int16_t wx = rs_wx, wy = rs_wy;
+		{
+			int16_t wx = rs_wx, wy = rs_wy;
 
-		if (ptr_off()) {
-			wx = 0;
-			wy = 0;
+			if (ptr_off()) {
+				wx = 0;
+				wy = 0;
+			}
+			if (ptr_off()) {
+				mg_rem_x = 0;
+				mg_rem_y = 0;
+			} else {
+				mouse_gain_apply(&wx, &wy);
+			}
+			r[0x09] = wx & 0xFF;
+			r[0x0A] = (wx >> 8) & 0xFF;
+			r[0x0B] = wy & 0xFF;
+			r[0x0C] = (wy >> 8) & 0xFF;
 		}
-		if (ptr_off()) {
-			mg_rem_x = 0;
-			mg_rem_y = 0;
-		} else {
-			mouse_gain_apply(&wx, &wy);
-		}
-		r[0x09] = wx & 0xFF;
-		r[0x0A] = (wx >> 8) & 0xFF;
-		r[0x0B] = wy & 0xFF;
-		r[0x0C] = (wy >> 8) & 0xFF;
 
 		rpt_dx = gyro_mode_on() ? gyro_dx : 0;
 		rpt_dy = gyro_mode_on() ? gyro_dy : 0;
@@ -4912,10 +6162,14 @@ static void enter_pair_mode(void)
 
 static bool sync_gesture_held(void)
 {
+	if (sync_mouse_down() ||
+	    ((peer_buttons & LINK_SYNC_REQ) != 0 && !jc_typing())) {
+		return true;
+	}
 #if defined(JC_LEFT)
 	return sync_key_down();
 #else
-	return (peer_buttons & LINK_SYNC_REQ) != 0;
+	return false;
 #endif
 }
 
@@ -5065,14 +6319,18 @@ static void dump_map(void)
 	}
 	printk("[MAP] sync %02X mods %02X %s\n", sync_key.code, sync_key.mods,
 	       sync_key.on ? "on" : "off");
+	ptr_dump();
 #else
 	printk("[MAP] side=R tag=" BUILD_TAG "\n");
 	printk("[MAP] sens %d\n", stick_mgain);
 	printk("[MAP] msens %u\n", mouse_gain);
 	printk("[MAP] stickdz %d\n", stick_dz);
 	printk("[MAP] stickvg %d\n", stick_vgain);
+	printk("[MAP] gyrogain %d\n", jm_gain);
+	ptr_dump();
 #endif
 	printk("[MAP] grip %d\n", grip_byte >= 0 ? 1 : 0);
+	printk("[MAP] single %u\n", single_dev);
 	printk("[MAP] prof act %u\n", prof_active);
 	for (uint8_t i = 0; i < JC_PROFILES; i++) {
 		printk("[MAP] prof %u %u %02X %02X %s\n", i + 1U,
@@ -5247,12 +6505,11 @@ static void console_drop_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	if (g_conn && !hid_ready()) {
+	if (g_conn && !input_ready()) {
 		bt_conn_disconnect(g_conn,
 				   BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 	}
 }
-static K_WORK_DEFINE(console_drop_work, console_drop_fn);
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
@@ -5281,10 +6538,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		batt_forget();
 		mouse_buttons = 0;
 #if defined(JC_LEFT)
-		kbd_mods = 0;
-		memset(kbd_keys, 0, sizeof(kbd_keys));
-		if (jc_mode == JC_MODE_KEYBOARD) {
-			jc_usb_kbd_release_all();
+		{
+			static const uint8_t none[6];
+
+			kbd_from(KB_OWN, 0, none);
 		}
 #endif
 		mouse_reports = 0;
@@ -5461,6 +6718,9 @@ int main(void)
 		printk("[HID] mouse=%s\n",
 		       g_mouse ? (sub_count ? "subscribed" : "linked") : "none");
 #endif
+		if (single_follows() && g_mouse) {
+			single_drop_hid();
+		}
 	}
 	return 0;
 }
