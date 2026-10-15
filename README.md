@@ -27,7 +27,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Keyboard mode:** The left half acts as a USB plugged keyboard for typing.
 - **Unpairing:**  If you want to disconnect from the console fully holding F12 removes the devices from the console.
 - **Crossmapping:** A keyboard can send A, B inputs and still act as the left Joy-Con, its vice versa for the mouse too.
-- **Split Device Connection:** This fakes one Joy-Con sides state to the console as connected, so inputs go through for each other. You no longer need 2 peripherals to connect to the console and can now control both Joy-Cons from a single device without having to pair another.
+- **Split Device Connection:** This fakes one Joy-Con sides state to the console as connected, so inputs go through for each other making it so you can use 1 peripheral device to control both Joy-Cons from a single device without having to pair 2 peripheral devices.
 - **Mouse mode:** A Bluetooth mouse emulates the Joy-Cons mouse state.
 - **Thumbstick mode:** A mouse can also control the right stick.
 - **Gyro Mode:** Emulate Gyro with the mouse.
