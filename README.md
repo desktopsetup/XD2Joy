@@ -10,6 +10,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 ## Contents
 
 - [Features](#features)
+- [What else is possible?](#what-else-is-possible)
 - [Known bugs](#bugs)
 - [Hardware setup](#hardware)
 - [Dongle vs DIY setup](#dongle-vs-diy-setup)
@@ -39,6 +40,10 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Colors:** You can change Joy-Con colors when the devices are paired to the console.
 
 <img src="Pair.jpg" width="900">
+
+## What else is possible?
+
+So far this is only for bluetooth devices being keyboard and mouse, once wired peripherals works in a newer firmware update. The possibilities of what can connect and work on the switch 2, expands. This firmware could be built upon to work with any gaming controller, Xbox, PlayStation, older Nintendo controllers, Turtle Beach, Steam controller, Flydigi, Arcade Controllers etc. Whatever gaming controller or device you use it most likely can be implemented to work on the Nintendo Switch 2.
 
 
 ## Bugs
