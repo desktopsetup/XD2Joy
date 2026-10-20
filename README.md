@@ -3,9 +3,9 @@
 </a>
 
 This firmware makes 2 nRF52840 chips appear to a Switch 2 as a left and right Joy-Con.
-The left side is the Bluetooth keyboard, the right as the Bluetooth mouse. The inputs can link with each other making it possible to have the Keyboard (left Joy-Con) send (right Joy-Con) input like A, B, X, Y, etc. making up for the little amount of inputs on most mice. It runs on a pair of Pro Micro nRF52840 boards and everything is set up in the browser with
-the [XD2Joy Web tool](https://desktopsetup.github.io/XD2Joy-Webtool/) making it more customizable. The **XD2Joy dongle** will be a
-consumer friendly version that is in development and is ran on this same firmware. **Wired peripheral support is being implemented in a future firmware update** 
+The left side is the keyboard, the right as the mouse. The inputs can link with each other making it possible to have the Keyboard (left Joy-Con) send (right Joy-Con) input like A, B, X, Y, etc. making up for the little amount of inputs on most mice. It runs on a pair of Pro Micro nRF52840 boards and everything is set up in the browser with
+the [XD2Joy Web tool](https://desktopsetup.github.io/XD2Joy-Webtool/). Wired support has been added and works based on the devices connected to your PC the Web-Tool then forwards it to the console. The **XD2Joy dongle** will be a
+consumer friendly version that is in development and is ran on this same firmware.
 
 ## Contents
 
@@ -29,6 +29,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - **Unpairing:**  If you want to disconnect from the console fully holding F12 removes the devices from the console.
 - **Crossmapping:** A keyboard can send A, B inputs and still act as the left Joy-Con, its vice versa for the mouse too.
 - **Split Device Connection:** This fakes one Joy-Con sides state to the console as connected, so inputs go through for each other making it so you can use 1 peripheral device to control both Joy-Cons from a single device without having to pair 2 peripheral devices.
+- **Wired Support:** Check the Web-Tools repo for more info on [Wired Support](https://github.com/desktopsetup/XD2Joy-Webtool/tree/main/wired)
 - **Mouse mode:** A Bluetooth mouse emulates the Joy-Cons mouse state.
 - **Thumbstick mode:** A mouse can also control the right stick.
 - **Gyro Mode:** Emulate Gyro with the mouse.
@@ -43,7 +44,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 
 ## What else is possible?
 
-So far this is only for bluetooth devices being keyboard and mouse, once wired peripherals works in a newer firmware update. The possibilities of what can connect and work on the switch 2, expands. This firmware could be built upon to work with any gaming controller, Xbox, PlayStation, older Nintendo controllers, Turtle Beach, Steam controller, Flydigi, Arcade Controllers etc. Whatever gaming controller or device you use it most likely can be implemented to work on the Nintendo Switch 2.
+This firmware could be built upon to work with any gaming controller, Xbox, PlayStation, older Nintendo controllers, Turtle Beach, Steam controller, Flydigi, Arcade Controllers etc. Whatever gaming controller or device you use it most likely can be implemented to work on the Nintendo Switch 2.
 
 
 ## Bugs
