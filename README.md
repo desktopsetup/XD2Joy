@@ -49,7 +49,7 @@ This firmware could be built upon to work with any gaming controller, Xbox, Play
 
 ## Bugs
 
-- **Wired Devices:** In the Web-Tool Wired support works but is more vulnerable to slip ups sending input to the PC and the console at the same time when it should only send its input to the console, the [Wired app](https://github.com/desktopsetup/XD2Joy-Webtool/releases/tag/v1.0) helps prevent these issues.
+- **Wired Devices:** In the Web-Tool Wired support works decent but is more vulnerable to slip ups sending input to the PC and the console at the same time when it should only send its input to the console, the [Wired app](https://github.com/desktopsetup/XD2Joy-Webtool/releases/tag/v1.0) helps prevent these issues.
 - **Bluetooth Classic:** Bluetooth Classic/Bluetooth 3.0 devices are not compatible and is a bug that can not be fixed since it is not Bluetooth Low Energy (BLE). 
 - **Connecting:** Sometimes when you do a fresh disconnect or new pair to the console only 1 of the Bluetooth devices pair and it takes backing out a couple times for it to recognize the other one.
 - **Snapping on slow mouse movement:** slow movements can snap visually, in both Mouse Mode and Thumbstick Mode. The Thumbstick Mode has a setting in the Web-Tool that helps.
