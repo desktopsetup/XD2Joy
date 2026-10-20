@@ -438,6 +438,9 @@ struct jc_sync_key {
 };
 static struct jc_sync_key sync_key = { SYNC_KEY, 0, 1 };
 
+static bool wired_on;
+static bool wired_fed;
+
 #define SINGLE_OFF 0
 #define SINGLE_KBD 1
 #define SINGLE_MOUSE 2
@@ -524,6 +527,15 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 		}
 		return 0;
 	}
+	if (settings_name_steq(name, "wired", &next) && !next) {
+		uint8_t on;
+
+		if (len == sizeof(on) &&
+		    read_cb(cb_arg, &on, sizeof(on)) == (ssize_t)sizeof(on)) {
+			wired_on = on != 0;
+		}
+		return 0;
+	}
 	if (settings_name_steq(name, "single", &next) && !next) {
 		uint8_t v[2] = { 0, 0 };
 
@@ -597,7 +609,9 @@ static void peer_clear(void);
 static void peer_commit(const bt_addr_le_t *addr);
 static void mode_set(uint8_t m);
 static void sync_cmd(const char *a);
+static void input_cmd(const char *a);
 static void single_cmd(const char *a);
+static void wired_rx(uint8_t c);
 
 static char cfg_cmd[CFG_CMD_MAX];
 static volatile size_t cfg_cmd_len;
@@ -907,6 +921,8 @@ static void cfg_cmd_fn(struct k_work *w)
 			       grip_byte == 0x01 ? " (IN THE CHARGING GRIP,"
 						   " as a real one reports)" : "");
 		}
+	} else if (!strncmp(c, "input", 5)) {
+		input_cmd(c + 5);
 	} else if (!strncmp(c, "single", 6)) {
 		single_cmd(c + 6);
 	} else if (!strncmp(c, "sync", 4)) {
@@ -942,6 +958,10 @@ static void cfg_uart_isr(const struct device *dev, void *user_data)
 	while (uart_irq_rx_ready(dev)) {
 		if (uart_fifo_read(dev, &c, 1) != 1) {
 			break;
+		}
+		if (wired_on) {
+			wired_rx(c);
+			continue;
 		}
 		if (cfg_cmd_ready) {
 			continue;
@@ -2362,6 +2382,9 @@ BT_GATT_SERVICE_DEFINE(_0b_svc_main,
 
 static bool hid_ready(void)
 {
+	if (wired_on) {
+		return wired_fed;
+	}
 	return g_mouse && sub_count && mouse_reports > 0;
 }
 
@@ -2371,7 +2394,7 @@ static bool input_ready(void)
 		return (peer_aux & LINK_AUX_DEV) != 0;
 	}
 #if defined(JC_LEFT)
-	if (peer_kbd_here()) {
+	if (!wired_on && peer_kbd_here()) {
 		return true;
 	}
 #endif
@@ -2381,6 +2404,12 @@ static bool input_ready(void)
 enum adv_mode { ADV_OFF, ADV_BONDED, ADV_PAIRABLE, ADV_WAKE };
 
 static int64_t wake_until;
+
+static const char *adv_mode_name(enum adv_mode m)
+{
+	return m == ADV_WAKE ? "WAKE" : m == ADV_PAIRABLE ? "PAIRABLE" :
+	       m == ADV_BONDED ? "BONDED" : "OFF";
+}
 
 static enum adv_mode adv_mode_wanted(void)
 {
@@ -2444,9 +2473,11 @@ static void adv_start(void)
 	}
 }
 
-static void arm_pairable_window(void)
+static void arm_pairable_window(const char *why)
 {
 	pairable_until = k_uptime_get() + PAIRABLE_MS;
+	printk("[SYNC] *** PAIR MODE for %d s: %s ***\n",
+	       PAIRABLE_MS / 1000, why);
 	adv_start();
 }
 
@@ -2462,18 +2493,6 @@ static void user_input_seen(void)
 		k_work_submit(&adv_work);
 	}
 }
-
-static void hid_pairing_complete(struct bt_conn *conn, bool bonded)
-{
-	if (!g_mouse || conn != g_mouse) {
-		return;
-	}
-	arm_pairable_window();
-}
-
-static struct bt_conn_auth_info_cb hid_auth_cb = {
-	.pairing_complete = hid_pairing_complete,
-};
 
 static void hid_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
@@ -3248,7 +3267,7 @@ static void kbd_apply(uint8_t mods, const uint8_t keys[6])
 		kbd_suppress = false;
 	}
 
-	if (jc_mode == JC_MODE_KEYBOARD && !kbd_suppress) {
+	if (jc_mode == JC_MODE_KEYBOARD && !kbd_suppress && !wired_on) {
 		jc_usb_kbd_send(kbd_mods, kbd_keys);
 	}
 }
@@ -3378,7 +3397,7 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		params->value_handle = 0;
 		return BT_GATT_ITER_STOP;
 	}
-	if (single_follows()) {
+	if (wired_on || single_follows()) {
 		return BT_GATT_ITER_CONTINUE;
 	}
 	mouse_reports++;
@@ -3967,7 +3986,7 @@ static void mode_set(uint8_t m)
 	printk("[MODE] now %s, joy-con input %s\n", jc_mode_name(),
 	       m == JC_MODE_KEYBOARD ? "IDLE (still connected)" : "live");
 #if defined(JC_LEFT)
-	if (m == JC_MODE_KEYBOARD && !jc_usb_kbd_ready()) {
+	if (m == JC_MODE_KEYBOARD && !wired_on && !jc_usb_kbd_ready()) {
 	}
 #endif
 }
@@ -4000,6 +4019,11 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	bool hid;
 	int err;
 
+	if (wired_on) {
+		bt_le_scan_stop();
+		scan_on = false;
+		return;
+	}
 	if (g_mouse && !scan_forced()) {
 		bt_le_scan_stop();
 		scan_on = false;
@@ -4100,7 +4124,7 @@ static void scan_work_handler(struct k_work *work)
 	int err;
 
 	ARG_UNUSED(work);
-	if (single_follows()) {
+	if (wired_on || single_follows()) {
 		if (scan_on) {
 			bt_le_scan_stop();
 			scan_on = false;
@@ -4123,7 +4147,240 @@ static void scan_work_handler(struct k_work *work)
 	scan_is_fast = fast;
 }
 
-static void single_drop_hid(void)
+#define WIRED_HOLD_MS 250
+
+static char wired_buf[CFG_CMD_MAX];
+static size_t wired_len;
+
+#if !defined(JC_LEFT)
+static uint8_t wkb_mods;
+static uint8_t wkb_keys[6];
+static bool wkb_on;
+
+static void wired_keys(uint8_t mods, const uint8_t keys[6])
+{
+	bool any = mods != 0, changed;
+	k_spinlock_key_t key;
+
+	for (int i = 0; i < 6; i++) {
+		any = any || keys[i] != 0;
+	}
+	key = k_spin_lock(&rkbd_lock);
+	changed = mods != wkb_mods || memcmp(keys, wkb_keys, 6) != 0 ||
+		  (any && !wkb_on);
+	wkb_on = wkb_on || any;
+	wkb_mods = mods;
+	memcpy(wkb_keys, keys, 6);
+	k_spin_unlock(&rkbd_lock, key);
+	if (changed) {
+		k_sem_give(&link_wake);
+	}
+	if (any) {
+		user_input_seen();
+	}
+}
+
+static bool wired_keys_held(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&rkbd_lock);
+	bool held = wkb_mods != 0;
+
+	for (int i = 0; i < 6; i++) {
+		held = held || wkb_keys[i] != 0;
+	}
+	k_spin_unlock(&rkbd_lock, key);
+	return held;
+}
+
+static void wired_keys_gone(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&rkbd_lock);
+
+	wkb_on = false;
+	wkb_mods = 0;
+	memset(wkb_keys, 0, 6);
+	k_spin_unlock(&rkbd_lock, key);
+	k_sem_give(&link_wake);
+}
+#else
+static void wired_keys(uint8_t mods, const uint8_t keys[6])
+{
+	kbd_from(KB_OWN, mods, keys);
+}
+
+static bool wired_keys_held(void)
+{
+	bool held = kb_from[KB_OWN].mods != 0;
+
+	for (int i = 0; i < 6; i++) {
+		held = held || kb_from[KB_OWN].keys[i] != 0;
+	}
+	return held;
+}
+#endif
+
+static bool wired_let_go_all(void)
+{
+	static const uint8_t none[6];
+	bool held = mouse_buttons != 0;
+	bool keys = wired_keys_held();
+
+	mouse_buttons = 0;
+	if (keys) {
+		wired_keys(0, none);
+	}
+	return held || keys;
+}
+
+static void wired_hold_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	if (wired_on) {
+		wired_let_go_all();
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(wired_hold_work, wired_hold_fn);
+
+static int wired_nums(const char *s, int base, long *v, int max)
+{
+	int n = 0;
+
+	for (;;) {
+		char *end;
+
+		while (*s == ' ' || *s == '\t') {
+			s++;
+		}
+		if (!*s) {
+			return n;
+		}
+		if (n == max) {
+			return -1;
+		}
+		v[n] = strtol(s, &end, base);
+		if (end == s || (*end && *end != ' ' && *end != '\t')) {
+			return -1;
+		}
+		n++;
+		s = end;
+	}
+}
+
+static int16_t wired_clamp16(long v)
+{
+	return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
+}
+
+#if defined(JC_LEFT)
+static int16_t wired_fit16(int16_t now, int16_t add)
+{
+	int32_t t = (int32_t)now + add;
+
+	t = t > 32767 ? 32767 : t < -32768 ? -32768 : t;
+	return (int16_t)(t - now);
+}
+
+static void wired_mouse(long dx, long dy, long wheel, uint8_t btn)
+{
+	int8_t w = wheel > 127 ? 127 : wheel < -127 ? -127 : (int8_t)wheel;
+	int16_t x = wired_fit16(mouse_dx, wired_clamp16(dx));
+	int16_t y = wired_fit16(mouse_dy, wired_clamp16(dy));
+
+	lmouse_apply(HM_XY | HM_WHEEL | HM_BTN, x, y, w, btn);
+}
+#else
+static void wired_mouse(long dx, long dy, long wheel, uint8_t btn)
+{
+	int16_t x = wired_clamp16(dx);
+	int16_t y = wired_clamp16(dy);
+	int8_t w = wheel > 127 ? 127 : wheel < -127 ? -127 : (int8_t)wheel;
+	int16_t ww = (int16_t)(mouse_wheel + w);
+
+	mouse_dx = wired_clamp16((long)mouse_dx + x);
+	mouse_dy = wired_clamp16((long)mouse_dy + y);
+	mouse_wheel = ww > 127 ? 127 : ww < -127 ? -127 : (int8_t)ww;
+	wheel_btn_feed(w);
+	if (x || y) {
+		rs_push(x, y);
+		mouse_has_moved = true;
+		user_input_seen();
+	}
+	mouse_buttons = btn;
+	if (btn) {
+		user_input_seen();
+	}
+}
+#endif
+
+static void wired_line(const char *s)
+{
+	long v[7] = { 0 };
+
+	if (s[0] == 'k') {
+		uint8_t keys[6];
+
+		if (wired_nums(s + 1, 16, v, 7) < 0) {
+			return;
+		}
+		for (int i = 0; i < 7; i++) {
+			if (v[i] < 0 || v[i] > 0xFF) {
+				return;
+			}
+		}
+		for (int i = 0; i < 6; i++) {
+			keys[i] = (uint8_t)v[i + 1];
+		}
+		wired_keys((uint8_t)v[0], keys);
+	} else if (s[0] == 'm') {
+		if (wired_nums(s + 1, 10, v, 4) < 0 || v[3] < 0 || v[3] > 0xFF) {
+			return;
+		}
+		wired_mouse(v[0], v[1], v[2], (uint8_t)v[3]);
+	} else {
+		return;
+	}
+	wired_fed = true;
+	k_work_reschedule(&wired_hold_work, K_MSEC(WIRED_HOLD_MS));
+}
+
+static void wired_rx(uint8_t c)
+{
+	if (c == '\r' || c == '\n') {
+		if (!wired_len) {
+			return;
+		}
+		wired_buf[wired_len] = '\0';
+		if ((wired_buf[0] == 'k' || wired_buf[0] == 'm') &&
+		    (wired_buf[1] == ' ' || wired_buf[1] == '\0')) {
+			wired_line(wired_buf);
+		} else if (!cfg_cmd_ready) {
+			memcpy(cfg_cmd, wired_buf, wired_len + 1);
+			cfg_cmd_len = wired_len;
+			cfg_cmd_ready = true;
+			k_work_submit(&cfg_cmd_work);
+		}
+		wired_len = 0;
+		return;
+	}
+	if (wired_len < sizeof(wired_buf) - 1) {
+		wired_buf[wired_len++] = (char)c;
+	}
+}
+
+static void wired_print(void)
+{
+#if defined(JC_LEFT)
+	printk("[WIRED] input %s: %s\n", wired_on ? "usb" : "bt",
+	       wired_on ? "the PC's keyboard or mouse, sent as k or m lines"
+			: "a Bluetooth keyboard");
+#else
+	printk("[WIRED] input %s: %s\n", wired_on ? "usb" : "bt",
+	       wired_on ? "the PC's keyboard or mouse, sent as k or m lines"
+			: "a Bluetooth mouse");
+#endif
+}
+
+static void wired_drop_hid(void)
 {
 	struct bt_conn *c;
 
@@ -4133,6 +4390,94 @@ static void single_drop_hid(void)
 	if (c) {
 		bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		bt_conn_unref(c);
+	}
+}
+
+static void wired_set(bool on)
+{
+	uint8_t v = on ? 1 : 0;
+
+	if (on == wired_on) {
+		wired_print();
+		return;
+	}
+	wired_on = on;
+	wired_fed = false;
+	wired_len = 0;
+	k_work_cancel_delayable(&wired_hold_work);
+	wired_let_go_all();
+#if !defined(JC_LEFT)
+	wired_keys_gone();
+#endif
+	if (on) {
+		k_work_cancel_delayable(&scan_work);
+		bt_le_scan_stop();
+		scan_on = false;
+		wired_drop_hid();
+#if defined(JC_LEFT)
+		if (jc_mode == JC_MODE_KEYBOARD) {
+			mode_set(JC_MODE_JOYCON);
+		}
+#endif
+	} else {
+		k_work_schedule(&scan_work, K_NO_WAIT);
+	}
+	settings_save_one("jc/wired", &v, sizeof(v));
+	k_work_submit(&adv_work);
+	wired_print();
+}
+
+static void wired_run(bool on)
+{
+	struct bt_conn *c;
+
+	if (!wired_on) {
+		wired_print();
+		return;
+	}
+	wired_fed = on;
+	k_work_submit(&adv_work);
+	if (on) {
+		user_input_seen();
+		return;
+	}
+	k_work_cancel_delayable(&wired_hold_work);
+	wired_let_go_all();
+#if !defined(JC_LEFT)
+	wired_keys_gone();
+#endif
+	k_sched_lock();
+	c = g_conn ? bt_conn_ref(g_conn) : NULL;
+	k_sched_unlock();
+	if (!c) {
+		return;
+	}
+	bt_conn_disconnect(c, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	bt_conn_unref(c);
+}
+
+static void input_cmd(const char *a)
+{
+	while (*a == ' ' || *a == '\t') {
+		a++;
+	}
+	if (!strcmp(a, "usb") || !strcmp(a, "wired")) {
+		wired_set(true);
+	} else if (!strcmp(a, "bt") || !strcmp(a, "bluetooth")) {
+		wired_set(false);
+	} else if (!strcmp(a, "start")) {
+		wired_run(true);
+	} else if (!strcmp(a, "stop")) {
+		wired_run(false);
+	} else if (!*a || *a == '?') {
+		wired_print();
+	}
+}
+
+static void wired_tick(void)
+{
+	if (g_mouse) {
+		wired_drop_hid();
 	}
 }
 
@@ -4147,11 +4492,14 @@ static void single_apply(uint8_t v, uint8_t gen)
 	single_dev = v;
 	single_gen = gen & 63;
 	if (single_follows()) {
+		if (wired_on) {
+			wired_set(false);
+		}
 		k_work_cancel_delayable(&scan_work);
 		bt_le_scan_stop();
 		scan_on = false;
-		single_drop_hid();
-	} else {
+		wired_drop_hid();
+	} else if (!wired_on) {
 		k_work_schedule(&scan_work, K_NO_WAIT);
 	}
 	single_save();
@@ -5078,9 +5426,15 @@ static void link_tx_keys(int64_t now)
 	int copies;
 	k_spinlock_key_t key = k_spin_lock(&rkbd_lock);
 
-	on = rkbd_on && !single_follows();
-	f[2] = rkbd_mods;
-	memcpy(f + 3, rkbd_keys, 6);
+	if (wired_on) {
+		on = wkb_on && !single_follows();
+		f[2] = wkb_mods;
+		memcpy(f + 3, wkb_keys, 6);
+	} else {
+		on = rkbd_on && !single_follows();
+		f[2] = rkbd_mods;
+		memcpy(f + 3, rkbd_keys, 6);
+	}
 	k_spin_unlock(&rkbd_lock, key);
 	if (!on) {
 		memset(f + 2, 0, 7);
@@ -6106,10 +6460,13 @@ static void send_report(void)
 		rot_apply(r);
 	}
 	if (!rot_test) {
-		uint16_t t = (uint16_t)((k_uptime_get() * 602) / 1000);
+		uint32_t now = k_uptime_get_32();
+		uint32_t dms = now - jm_ms;
 
-		r[MOTION_AT + 5] = (uint8_t)(t & 0xFF);
-		r[MOTION_AT + 6] = (uint8_t)(t >> 8);
+		jm_ms = now;
+		dms = (dms < 1U) ? 1U : (dms > 2000U) ? 2000U : dms;
+		jm_put(r, 0, 12, now & 0xFFFU);
+		jm_put(r, 12, 12, dms);
 	}
 #endif
 
@@ -6142,7 +6499,7 @@ static void flush_pending_responses(void)
 	}
 }
 
-static void enter_pair_mode(void)
+static void enter_pair_mode(const char *why)
 {
 	host_pending = false;
 	console_bonded = false;
@@ -6153,7 +6510,7 @@ static void enter_pair_mode(void)
 		bt_unpair(BT_ID_DEFAULT, &console_addr);
 	}
 
-	arm_pairable_window();
+	arm_pairable_window(why);
 
 	if (g_conn) {
 		bt_conn_disconnect(g_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -6223,7 +6580,7 @@ static void sync_tick(void)
 
 	if (sync_cmd_req) {
 		sync_cmd_req = false;
-		enter_pair_mode();
+		enter_pair_mode("sync command");
 	}
 	if (!sync_gesture_held()) {
 		holding = false;
@@ -6238,7 +6595,7 @@ static void sync_tick(void)
 	}
 	if (!fired && k_uptime_get() - held_since >= SYNC_HOLD_MS) {
 		fired = true;
-		enter_pair_mode();
+		enter_pair_mode("sync key held");
 	}
 }
 
@@ -6455,6 +6812,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
+	printk("[JC] *** CONNECTED from %s ***\n", astr);
 	report_pace(info.le.interval_us);
 
 	bt_le_adv_stop();
@@ -6573,6 +6931,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		console_bonded = true;
 		host_pending = false;
 		pairable_until = 0;
+		printk("[JC] bonded from now on\n");
 	}
 
 	if (g_conn) {
@@ -6672,8 +7031,6 @@ int main(void)
 		}
 	}
 
-	bt_conn_auth_info_cb_register(&hid_auth_cb);
-
 	adv_start();
 	k_work_schedule(&scan_work, K_NO_WAIT);
 
@@ -6693,6 +7050,18 @@ int main(void)
 				batt_read_busy = false;
 			}
 		}
+		printk("[ADV] %s bonded=%d hid=%d single=%u peer=%d active=%d window=%ds"
+		       " host=%02X:%02X:%02X wake=%ds\n",
+		       adv_mode_name(adv_mode_wanted()), (int)console_bonded,
+		       g_mouse ? 1 : 0, single_dev,
+		       (int)((peer_aux & LINK_AUX_DEV) != 0), (int)user_active,
+		       pairable_until
+			       ? (int)((pairable_until - k_uptime_get()) / 1000)
+			       : 0,
+		       mfg_data[ADV_OFF_HOST + 2], mfg_data[ADV_OFF_HOST + 1],
+		       mfg_data[ADV_OFF_HOST],
+		       wake_until ? (int)((wake_until - k_uptime_get()) / 1000)
+				  : 0);
 		adv_start();
 		dump_map();
 
@@ -6713,13 +7082,21 @@ int main(void)
 
 #if defined(JC_LEFT)
 		printk("[HID] kbd=%s\n",
+		       wired_on ? "wired" :
 		       g_mouse ? (sub_count ? "subscribed" : "linked") : "none");
 #else
 		printk("[HID] mouse=%s\n",
+		       wired_on ? "wired" :
 		       g_mouse ? (sub_count ? "subscribed" : "linked") : "none");
 #endif
+		if (single_follows() && wired_on) {
+			wired_set(false);
+		}
+		if (wired_on) {
+			wired_tick();
+		}
 		if (single_follows() && g_mouse) {
-			single_drop_hid();
+			wired_drop_hid();
 		}
 	}
 	return 0;
