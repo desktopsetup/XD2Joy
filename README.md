@@ -21,7 +21,7 @@ consumer friendly version that is in development and is ran on this same firmwar
 - [License](#license)
 
 ## Features
-- **Amiibo's:** Amiibo's are supported by being loaded in the Web-Tool. (Amiibo's are not included import them yourself.)
+- **Amiibo's:** are supported by being loaded in the Web-Tool. (Amiibo's are not included import them yourself.)
 - **Amiibo Tag ID:** you can randomize the tag ID of a amiibo so you can bypass daily limits on some games (e.g, Zelda BOTW)
 - **Battery:** The firmware reads the BT devices battery health for the console to understand.
 - **Remapping:** Map any key or mouse button to any Joy-Con button.
