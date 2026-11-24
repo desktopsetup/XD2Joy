@@ -132,6 +132,8 @@ static bool have_ltk;
 #define BTN_CAPTURE 0x0100
 #define STICK_CX 2077
 #define STICK_CY 1984
+#define LSTICK_CX 2081
+#define LSTICK_CY 2088
 #define STICK_THROW 1200
 #define STICK_Y_UP_POSITIVE 1
 
@@ -201,6 +203,9 @@ static const uint8_t RSP_08_01[] = {
 #define JC_SET_STICK_DZ 4
 #define JC_SET_STICK_VG 5
 #define JC_SET_GYRO_GAIN 6
+#define JC_SET_ACCEL_LO 7
+#define JC_SET_ACCEL_SLOW 8
+#define JC_SET_ACCEL_FAST 9
 
 #define JC_STICK(dx, dy) ((uint16_t)((((uint16_t)(uint8_t)(int8_t)(dy)) << 8) | ((uint16_t)(uint8_t)(int8_t)(dx))))
 
@@ -280,7 +285,7 @@ static const volatile struct jc_cfg CFG_FLASH = {
 	},
 #else
 	.side = 0x66,
-	.n_btn = 10,
+	.n_btn = 13,
 	.stick_src_x = JC_SRC_NONE,
 	.stick_src_y = JC_SRC_NONE,
 	.col_body = { 0x4B, 0xA1, 0x6B },
@@ -295,6 +300,9 @@ static const volatile struct jc_cfg CFG_FLASH = {
 		{ JC_SET_STICK_GAIN, JC_BTN_SET, 10 },
 		{ JC_SET_MOUSE_GAIN, JC_BTN_SET, 420 },
 		{ JC_SET_ACCEL, JC_BTN_SET, 1 },
+		{ JC_SET_ACCEL_LO, JC_BTN_SET, 24 },
+		{ JC_SET_ACCEL_SLOW, JC_BTN_SET, 4 },
+		{ JC_SET_ACCEL_FAST, JC_BTN_SET, 70 },
 		{ JC_SET_STICK_DZ, JC_BTN_SET, 290 },
 		{ JC_SET_STICK_VG, JC_BTN_SET, 5 },
 		{ JC_SET_GYRO_GAIN, JC_BTN_SET, 32 },
@@ -438,8 +446,17 @@ struct jc_sync_key {
 };
 static struct jc_sync_key sync_key = { SYNC_KEY, 0, 1 };
 
+static uint8_t amiibo_key;
+
 static bool wired_on;
 static bool wired_fed;
+
+#if !defined(JC_LEFT)
+#define AMIIBO_LEN 540
+static uint8_t amiibo[AMIIBO_LEN];
+static bool amiibo_have;
+static bool amiibo_held;
+#endif
 
 #define SINGLE_OFF 0
 #define SINGLE_KBD 1
@@ -527,6 +544,12 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 		}
 		return 0;
 	}
+	if (settings_name_steq(name, "amiibokey", &next) && !next) {
+		if (len == sizeof(amiibo_key)) {
+			read_cb(cb_arg, &amiibo_key, sizeof(amiibo_key));
+		}
+		return 0;
+	}
 	if (settings_name_steq(name, "wired", &next) && !next) {
 		uint8_t on;
 
@@ -555,6 +578,24 @@ static int cfg_set(const char *name, size_t len, settings_read_cb read_cb,
 		}
 		return 0;
 	}
+#if !defined(JC_LEFT)
+	if (settings_name_steq(name, "amiibo", &next) && !next) {
+		if (len == AMIIBO_LEN &&
+		    read_cb(cb_arg, amiibo, AMIIBO_LEN) == (ssize_t)AMIIBO_LEN) {
+			amiibo_have = true;
+		}
+		return 0;
+	}
+	if (settings_name_steq(name, "amiiboauto", &next) && !next) {
+		uint8_t on;
+
+		if (len == sizeof(on) &&
+		    read_cb(cb_arg, &on, sizeof(on)) == (ssize_t)sizeof(on)) {
+			amiibo_held = on != 0;
+		}
+		return 0;
+	}
+#endif
 	if (!settings_name_steq(name, "cfg", &next) || next) {
 		return -ENOENT;
 	}
@@ -610,6 +651,10 @@ static void peer_commit(const bt_addr_le_t *addr);
 static void mode_set(uint8_t m);
 static void sync_cmd(const char *a);
 static void input_cmd(const char *a);
+#if !defined(JC_LEFT)
+static void amiibo_cmd(const char *a);
+#endif
+static void amiibo_key_cmd(const char *a);
 static void single_cmd(const char *a);
 static void wired_rx(uint8_t c);
 
@@ -718,6 +763,7 @@ static void cfg_cmd_default(void)
 #define LINK_AUX_ACT 0x0010
 #define LINK_AUX_DEV 0x0020
 #define LINK_AUX_TYPING 0x0040
+#define LINK_AUX_AMIIBO 0x0200
 
 #define LINK_SYNC1_KEYS 0x5D
 #define LINK_KEYS_LEN 10
@@ -923,6 +969,12 @@ static void cfg_cmd_fn(struct k_work *w)
 		}
 	} else if (!strncmp(c, "input", 5)) {
 		input_cmd(c + 5);
+	} else if (!strncmp(c, "amiibo key", 10)) {
+		amiibo_key_cmd(c + 10);
+#if !defined(JC_LEFT)
+	} else if (!strncmp(c, "amiibo", 6)) {
+		amiibo_cmd(c + 6);
+#endif
 	} else if (!strncmp(c, "single", 6)) {
 		single_cmd(c + 6);
 	} else if (!strncmp(c, "sync", 4)) {
@@ -1013,6 +1065,13 @@ static void cfg_serial_init(void)
 static uint16_t report_ms = REPORT_MS;
 
 static uint32_t link_us;
+
+static K_SEM_DEFINE(rpt_kick, 0, 1);
+
+static void rpt_soon(void)
+{
+	k_sem_give(&rpt_kick);
+}
 
 static void report_pace(uint32_t interval_us)
 {
@@ -1131,12 +1190,20 @@ static struct k_spinlock rs_lock;
 #define LMOUSE_GAIN_DEFAULT 420
 #define LMOUSE_ACCEL_DEFAULT true
 static uint16_t mouse_gain = MOUSE_GAIN_DEFAULT;
-static int32_t mg_rem_x, mg_rem_y;
 
+#define ACCEL_LO_DEFAULT 24
+#define ACCEL_SLOW_DEFAULT 4
+#define ACCEL_FAST_DEFAULT 70
+#define ACCEL_LO_MIN 5
+#define ACCEL_LO_MAX 100
+#define ACCEL_SLOW_MIN 1
+#define ACCEL_SLOW_MAX 2000
+#define ACCEL_FAST_MIN 2
+#define ACCEL_FAST_MAX 5000
 static bool accel_on;
-static const uint16_t accel_lo = 100;
-static const int32_t accel_slow = 300;
-static const int32_t accel_fast = 3000;
+static uint16_t accel_lo = ACCEL_LO_DEFAULT;
+static int32_t accel_slow = ACCEL_SLOW_DEFAULT;
+static int32_t accel_fast = ACCEL_FAST_DEFAULT;
 static int32_t accel_rate;
 static int32_t accel_acc;
 static const int32_t accel_tau = 200000;
@@ -1168,46 +1235,166 @@ static void accel_feed(int16_t x, int16_t y, int64_t now)
 	accel_rate = (int32_t)((int64_t)accel_acc * 1000000 / accel_tau);
 }
 
+static uint16_t accel_lo_gain(void)
+{
+	int32_t lo = (int32_t)mouse_gain * accel_lo / 100;
+
+	return (uint16_t)(lo < 1 ? 1 : lo);
+}
+
 static uint16_t gain_now(void)
 {
-	int32_t r, span;
-	uint16_t hi = mouse_gain;
+	int64_t r, slow, span;
+	uint16_t hi = mouse_gain, lo;
 
-	if (!accel_on || hi <= accel_lo) {
+	if (!accel_on || accel_lo >= 100 || accel_fast <= accel_slow) {
 		return hi;
 	}
+	lo = accel_lo_gain();
 	accel_decay(k_ticks_to_us_floor64(k_uptime_ticks()));
-	r = accel_rate;
-	if (r <= accel_slow) {
-		return accel_lo;
+	r = (int64_t)accel_rate * hi;
+	slow = (int64_t)accel_slow * 10000;
+	if (r <= slow) {
+		return lo;
 	}
-	if (r >= accel_fast) {
+	span = (int64_t)(accel_fast - accel_slow) * 10000;
+	if (r >= slow + span) {
 		return hi;
 	}
-	span = accel_fast - accel_slow;
-	return (uint16_t)((int32_t)accel_lo +
-			  (int32_t)(hi - accel_lo) * (r - accel_slow) / span);
+	return (uint16_t)(lo + (int64_t)(hi - lo) * (r - slow) / span);
 }
 
-static int16_t mouse_gain_one(int16_t v, int32_t *rem)
+static const int32_t flow_k = 1;
+static const int32_t flow_stretch = 125;
+static const int32_t flow_max = 200000;
+static const int32_t flow_first = 30000;
+#define FLOW_EMA 2
+#define FLOW_STALE_US 500000
+#define FLOW_OWED_MAX 32767000
+
+struct flow_axis {
+	int32_t rem;
+	int32_t win;
+	int32_t acc;
+	int32_t gap;
+	int32_t per;
+	int64_t last;
+	int64_t at;
+};
+static struct flow_axis flow_x, flow_y;
+static int64_t flow_taken;
+
+static void flow_clear(void)
+{
+	memset(&flow_x, 0, sizeof(flow_x));
+	memset(&flow_y, 0, sizeof(flow_y));
+}
+
+static void flow_advance(struct flow_axis *f, int64_t t)
+{
+	int64_t dt = t - f->at;
+	int32_t out;
+
+	f->at = t;
+	if (!f->rem || dt <= 0) {
+		return;
+	}
+	if (dt >= f->win) {
+		out = f->rem;
+		f->win = 0;
+	} else {
+		out = (int32_t)((int64_t)f->rem * dt / f->win);
+		f->win -= (int32_t)dt;
+	}
+	f->rem -= out;
+	f->acc += out;
+	f->acc = (f->acc > FLOW_OWED_MAX) ? FLOW_OWED_MAX :
+		 (f->acc < -FLOW_OWED_MAX) ? -FLOW_OWED_MAX : f->acc;
+}
+
+static void flow_feed(struct flow_axis *f, int16_t c, int32_t g, int64_t t)
+{
+	int64_t gap, owed;
+
+	if (!c) {
+		return;
+	}
+	flow_advance(f, t);
+	gap = f->last ? t - f->last : INT64_MAX;
+	if (gap >= 2000) {
+		f->last = t;
+		if (gap > flow_max) {
+			f->gap = 0;
+			f->per = 0;
+			f->win = flow_first;
+		} else {
+			int32_t per = (int32_t)(gap / (c < 0 ? -c : c));
+			int64_t w, w2;
+
+			if (!f->gap) {
+				f->gap = (int32_t)gap;
+				f->per = per;
+			} else {
+				f->gap += ((int32_t)gap - f->gap) / (1 << FLOW_EMA);
+				f->per += (per - f->per) / (1 << FLOW_EMA);
+			}
+			w = (int64_t)f->gap * flow_stretch / 100;
+			w2 = (int64_t)f->per * flow_k;
+			if (w2 > w) {
+				w = w2;
+			}
+			f->win = (w > flow_max) ? flow_max : (int32_t)w;
+		}
+	}
+	owed = (int64_t)f->rem + (int32_t)c * g;
+	f->rem = (owed > FLOW_OWED_MAX) ? FLOW_OWED_MAX :
+		 (owed < -FLOW_OWED_MAX) ? -FLOW_OWED_MAX : (int32_t)owed;
+}
+
+static void flow_event(int16_t x, int16_t y, int64_t now)
+{
+	k_spinlock_key_t key;
+	int32_t g;
+
+	g = gain_now();
+	key = k_spin_lock(&rs_lock);
+	flow_feed(&flow_x, x, g, now);
+	flow_feed(&flow_y, y, g, now);
+	k_spin_unlock(&rs_lock, key);
+}
+
+static int16_t flow_take(struct flow_axis *f, int64_t now)
 {
 	int32_t n;
-	uint16_t g = gain_now();
 
-	if (g == 100) {
-		*rem = 0;
-		return v;
-	}
-	n = (int32_t)v * (int32_t)g + *rem;
-	*rem = n % 100;
-	n /= 100;
-	return (n > 32767) ? 32767 : (n < -32768) ? -32768 : (int16_t)n;
+	flow_advance(f, now);
+	n = f->acc / 100;
+	n = (n > 32767) ? 32767 : (n < -32768) ? -32768 : n;
+	f->acc -= n * 100;
+	return (int16_t)n;
 }
 
-static void mouse_gain_apply(int16_t *x, int16_t *y)
+static void flow_emit(int16_t *ox, int16_t *oy)
 {
-	*x = mouse_gain_one(*x, &mg_rem_x);
-	*y = mouse_gain_one(*y, &mg_rem_y);
+	int64_t now = k_ticks_to_us_floor64(k_uptime_ticks());
+	k_spinlock_key_t key = k_spin_lock(&rs_lock);
+
+	if (flow_taken && now - flow_taken > FLOW_STALE_US) {
+		flow_clear();
+	}
+	flow_taken = now;
+	*ox = flow_take(&flow_x, now);
+	*oy = flow_take(&flow_y, now);
+	k_spin_unlock(&rs_lock, key);
+}
+
+static void flow_drop(void)
+{
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&rs_lock);
+	flow_clear();
+	k_spin_unlock(&rs_lock, key);
 }
 
 static void rs_push(int16_t x, int16_t y)
@@ -1218,6 +1405,7 @@ static void rs_push(int16_t x, int16_t y)
 	int64_t gap;
 
 	accel_feed(x, y, now);
+	flow_event(x, y, now);
 	key = k_spin_lock(&rs_lock);
 	last = &rs_ring[rs_head];
 	gap = now - last->t;
@@ -1396,6 +1584,53 @@ static bool sync_mouse_down(void)
 
 	return b && sync_key.on && jc_live() && !jc_typing() &&
 	       (mouse_buttons & b) != 0;
+}
+
+static bool amiibo_key_down(void)
+{
+	uint8_t k = amiibo_key;
+
+	if (!k || !jc_live() || jc_typing()) {
+		return false;
+	}
+	if (k >= SYNC_MOUSE) {
+		return k <= SYNC_MOUSE + 7 &&
+		       (mouse_buttons & (1U << (k - SYNC_MOUSE))) != 0;
+	}
+#if defined(JC_LEFT)
+	for (int i = 0; i < 6; i++) {
+		if (kbd_keys[i] == k) {
+			return true;
+		}
+	}
+#endif
+	return false;
+}
+
+static void amiibo_key_print(void)
+{
+	printk("[AMIIBO] key 0x%02X\n", amiibo_key);
+}
+
+static void amiibo_key_cmd(const char *a)
+{
+	char *e;
+	long code;
+
+	while (*a == ' ' || *a == '\t') {
+		a++;
+	}
+	if (!*a || *a == '?') {
+		amiibo_key_print();
+		return;
+	}
+	code = strtol(a, &e, 0);
+	if (e == a || code < 0 || code > 0xFF) {
+		return;
+	}
+	amiibo_key = (uint8_t)code;
+	settings_save_one("jc/amiibokey", &amiibo_key, sizeof(amiibo_key));
+	amiibo_key_print();
 }
 
 static volatile uint16_t push_tx;
@@ -1779,8 +2014,71 @@ static bool ptr_off(void)
 }
 #endif
 
+#define PTR_REST_DEFAULT 10
+static const uint16_t ptr_rest_s = PTR_REST_DEFAULT;
+static volatile uint32_t ptr_used_ms;
+static volatile bool ptr_used_ever;
+
+static void ptr_used(void)
+{
+	ptr_used_ms = k_uptime_get_32();
+	ptr_used_ever = true;
+}
+
+static bool ptr_resting(void)
+{
+	return !ptr_used_ever ||
+	       (uint32_t)(k_uptime_get_32() - ptr_used_ms) >= (uint32_t)ptr_rest_s * 1000U;
+}
+
+#define PTR_WAKE_DEFAULT 64
+static const uint16_t ptr_wake = PTR_WAKE_DEFAULT;
+static uint32_t ptr_wake_sum;
+
+static void ptr_moved(int32_t dx, int32_t dy)
+{
+	uint32_t m = (uint32_t)(dx < 0 ? -dx : dx) + (uint32_t)(dy < 0 ? -dy : dy);
+
+	if (m > 65535U) {
+		m = 65535U;
+	}
+	ptr_wake_sum = ptr_wake_sum * 7U / 8U + m;
+	if (m && ptr_wake_sum >= ptr_wake) {
+		ptr_used();
+	}
+}
+
+static void cfg_accel_apply(void)
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+	uint16_t lo = ACCEL_LO_DEFAULT;
+	int32_t slow = ACCEL_SLOW_DEFAULT, fast = ACCEL_FAST_DEFAULT;
+
+	for (uint8_t j = 0; j < nb; j++) {
+		uint16_t v = CFG.btn[j].mask;
+
+		if (CFG.btn[j].kind != JC_BTN_SET) {
+			continue;
+		}
+		if (CFG.btn[j].code == JC_SET_ACCEL_LO &&
+		    v >= ACCEL_LO_MIN && v <= ACCEL_LO_MAX) {
+			lo = v;
+		} else if (CFG.btn[j].code == JC_SET_ACCEL_SLOW &&
+			   v >= ACCEL_SLOW_MIN && v <= ACCEL_SLOW_MAX) {
+			slow = v;
+		} else if (CFG.btn[j].code == JC_SET_ACCEL_FAST &&
+			   v >= ACCEL_FAST_MIN && v <= ACCEL_FAST_MAX) {
+			fast = v;
+		}
+	}
+	accel_lo = lo;
+	accel_slow = slow;
+	accel_fast = fast;
+}
+
 static void cfg_settings_apply(void)
 {
+	cfg_accel_apply();
 #if defined(JC_LEFT)
 	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
 	uint16_t mgain = LMOUSE_GAIN_DEFAULT;
@@ -1803,8 +2101,6 @@ static void cfg_settings_apply(void)
 	accel_on = accel;
 	if (mouse_gain != mgain) {
 		mouse_gain = mgain;
-		mg_rem_x = 0;
-		mg_rem_y = 0;
 	}
 #else
 	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
@@ -1854,8 +2150,6 @@ static void cfg_settings_apply(void)
 	jm_gain = gg;
 	if (mouse_gain != mgain) {
 		mouse_gain = mgain;
-		mg_rem_x = 0;
-		mg_rem_y = 0;
 	}
 #endif
 }
@@ -1958,6 +2252,7 @@ static const struct bt_gatt_attr *rpt_hid_attr;
 static bool streaming;
 static int64_t stream_started_at;
 static uint32_t report_seq;
+static uint32_t reports_sent;
 
 static bool hid_reattached;
 
@@ -2117,6 +2412,303 @@ static void send_response(uint8_t cmd, uint8_t sub,
 	}
 }
 
+#if !defined(JC_LEFT)
+#define NFC_TAG_MS 300
+#define NFC_READ_MS 200
+#define NFC_PIECE_MAX 69
+static volatile int64_t nfc_tag_at;
+static volatile int64_t nfc_read_at;
+static volatile uint8_t nfc_state;
+static volatile uint8_t nfc_status = 0x00;
+static volatile bool nfc_polling;
+static volatile bool nfc_tap;
+static uint8_t nfc_result[60 + AMIIBO_LEN];
+static uint16_t nfc_result_len;
+static uint8_t amiibo_in[AMIIBO_LEN];
+
+static volatile bool nfc_lifted;
+static volatile bool nfc_empty = true;
+static volatile int64_t nfc_none_at;
+static volatile int64_t nfc_win_end;
+
+#define NFC_WRITE_MAX 600
+#define NFC_WRITE_MS 300
+static uint8_t nfc_wbuf[NFC_WRITE_MAX];
+static uint16_t nfc_wlen;
+static volatile int64_t nfc_write_at;
+
+static void amiibo_uid(uint8_t *out)
+{
+	memcpy(out, amiibo, 3);
+	memcpy(out + 3, amiibo + 4, 4);
+}
+
+static const char *nfc_write(void)
+{
+	const uint8_t *w = nfc_wbuf;
+	uint8_t uid[7];
+	uint16_t i;
+
+	if (nfc_wlen < 24) {
+		return "too short";
+	}
+	amiibo_uid(uid);
+	if (memcmp(w + 2, uid, 7)) {
+		return "it is for another tag";
+	}
+	for (i = 22; i + 1 < nfc_wlen && w[i] && w[i + 1]; i += 2 + w[i + 1]) {
+		if (w[i] < 4 || w[i] * 4 + w[i + 1] > 130 * 4) {
+			return "a block outside the tag's data pages";
+		}
+		if (i + 2 + w[i + 1] > nfc_wlen) {
+			return "its last block is cut short";
+		}
+	}
+	for (i = 22; i + 1 < nfc_wlen && w[i] && w[i + 1]; i += 2 + w[i + 1]) {
+		memcpy(amiibo + w[i] * 4, w + i + 2, w[i + 1]);
+	}
+	memcpy(amiibo + 16, w + 17, 4);
+	return NULL;
+}
+
+static void amiibo_save_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	settings_save_one("jc/amiibo", amiibo, AMIIBO_LEN);
+}
+static K_WORK_DEFINE(amiibo_save_work, amiibo_save_fn);
+
+static void nfc_build(const uint8_t *p, uint16_t plen)
+{
+	uint16_t n = 60;
+	uint8_t count = (plen > 10) ? p[10] : 0;
+
+	memset(nfc_result, 0, 60);
+	nfc_result[0] = 0x04;
+	nfc_result[4] = 0x01;
+	nfc_result[5] = 0x02;
+	nfc_result[7] = 0x07;
+	amiibo_uid(nfc_result + 8);
+	if (plen >= 19) {
+		memcpy(nfc_result + 51, p + 10, 9);
+	}
+	for (uint8_t i = 0; i < count && i < 4 && plen >= 13 + 2 * i; i++) {
+		uint8_t a = p[11 + 2 * i], b = p[12 + 2 * i];
+		uint16_t m = (uint16_t)((b - a + 1) * 4);
+
+		if (a > b || b >= AMIIBO_LEN / 4 || n + m > sizeof(nfc_result)) {
+			continue;
+		}
+		memcpy(nfc_result + n, amiibo + a * 4, m);
+		n += m;
+	}
+	nfc_result_len = n;
+}
+
+static void amiibo_print(void)
+{
+	if (amiibo_have) {
+		printk("[AMIIBO] loaded id=%02X%02X%02X%02X%02X%02X%02X%02X held=%s n=%u\n",
+		       amiibo[84], amiibo[85], amiibo[86], amiibo[87], amiibo[88],
+		       amiibo[89], amiibo[90], amiibo[91], amiibo_held ? "yes" : "no",
+		       (unsigned)((amiibo[17] << 8) | amiibo[18]));
+	} else {
+		printk("[AMIIBO] none held=%s\n", amiibo_held ? "yes" : "no");
+	}
+}
+
+static int amiibo_nib(char c)
+{
+	return (c >= '0' && c <= '9') ? c - '0' :
+	       (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+	       (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+}
+
+static void amiibo_now(void)
+{
+	if (amiibo_have && nfc_polling && !nfc_state && !nfc_tag_at) {
+		nfc_none_at = 0;
+		nfc_lifted = false;
+		nfc_tag_at = k_uptime_get() + NFC_TAG_MS;
+	}
+}
+
+static void amiibo_off(void)
+{
+	nfc_tap = false;
+	if (nfc_polling && !nfc_state) {
+		nfc_tag_at = 0;
+		nfc_empty = true;
+		nfc_status = 0x01;
+		nfc_none_at = nfc_win_end;
+	}
+}
+
+#define AMIIBO_TAP_MS 500
+static volatile uint32_t nfc_reads;
+static volatile bool amiibo_key_on;
+
+static void amiibo_key_tick(void)
+{
+	static int64_t since;
+	static uint32_t reads;
+	bool down = (peer_aux & LINK_AUX_AMIIBO) != 0 || amiibo_key_down();
+
+	if (down == amiibo_key_on) {
+		return;
+	}
+	amiibo_key_on = down;
+	if (down) {
+		since = k_uptime_get();
+		reads = nfc_reads;
+		if (!amiibo_have) {
+			return;
+		}
+		nfc_lifted = false;
+		amiibo_now();
+		return;
+	}
+	if (!amiibo_have || amiibo_held) {
+		return;
+	}
+	if (k_uptime_get() - since < AMIIBO_TAP_MS && nfc_reads == reads) {
+		nfc_tap = true;
+	} else {
+		amiibo_off();
+	}
+}
+
+static uint8_t amiibo_snap[AMIIBO_LEN];
+static int amiibo_dump_off = -1;
+static uint32_t amiibo_dump_sum;
+static void amiibo_dump_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(amiibo_dump_work, amiibo_dump_fn);
+
+static void amiibo_dump_fn(struct k_work *work)
+{
+	static char line[2 * 135 + 1];
+	static const char hx[] = "0123456789ABCDEF";
+	int off = amiibo_dump_off;
+
+	ARG_UNUSED(work);
+	if (off < 0) {
+		return;
+	}
+	if (off >= AMIIBO_LEN) {
+		amiibo_dump_off = -1;
+		printk("[AMIIBO] data end sum=%08X\n", (unsigned)amiibo_dump_sum);
+		return;
+	}
+	for (int k = 0; k < 135; k++) {
+		line[2 * k] = hx[amiibo_snap[off + k] >> 4];
+		line[2 * k + 1] = hx[amiibo_snap[off + k] & 15];
+		amiibo_dump_sum = (amiibo_dump_sum ^ amiibo_snap[off + k]) * 16777619U;
+	}
+	line[2 * 135] = '\0';
+	printk("[AMIIBO] data %d %s\n", off, line);
+	amiibo_dump_off = off + 135;
+	k_work_schedule(&amiibo_dump_work, K_MSEC(30));
+}
+
+static void amiibo_cmd(const char *a)
+{
+	while (*a == ' ' || *a == '\t') {
+		a++;
+	}
+	if (!*a || *a == '?') {
+		amiibo_print();
+		return;
+	}
+	if (!strncmp(a, "load", 4)) {
+		char *s;
+		long off = strtol(a + 4, &s, 10);
+		int n = 0;
+
+		while (*s == ' ' || *s == '\t') {
+			s++;
+		}
+		for (; *s && *s != ' ' && *s != '\t'; s += 2) {
+			int hi = amiibo_nib(s[0]), lo = s[1] ? amiibo_nib(s[1]) : -1;
+
+			if (hi < 0 || lo < 0 || off < 0 || off + n >= AMIIBO_LEN) {
+				printk("[AMIIBO] rejected: a load line it could not read\n");
+				return;
+			}
+			amiibo_in[off + n++] = (uint8_t)((hi << 4) | lo);
+		}
+		printk("[AMIIBO] got %d bytes at %ld\n", n, off);
+		return;
+	}
+	if (!strcmp(a, "use")) {
+		const uint8_t *t = amiibo_in;
+
+		if (t[3] != (0x88 ^ t[0] ^ t[1] ^ t[2]) ||
+		    t[8] != (t[4] ^ t[5] ^ t[6] ^ t[7])) {
+			printk("[AMIIBO] rejected: its UID check bytes are wrong\n");
+			return;
+		}
+		if (t[12] != 0xF1 || t[13] != 0x10 || t[14] != 0xFF ||
+		    t[15] != 0xEE || t[16] != 0xA5) {
+			printk("[AMIIBO] rejected: not an amiibo\n");
+			return;
+		}
+		memcpy(amiibo, amiibo_in, AMIIBO_LEN);
+		memset(amiibo + 532, 0, 8);
+		amiibo_have = true;
+		nfc_lifted = false;
+		settings_save_one("jc/amiibo", amiibo, AMIIBO_LEN);
+		amiibo_print();
+		return;
+	}
+	if (!strcmp(a, "clear")) {
+		amiibo_have = false;
+		nfc_tap = false;
+		nfc_lifted = false;
+		nfc_tag_at = 0;
+		nfc_empty = true;
+		nfc_status = nfc_polling ? 0x01 : 0x00;
+		nfc_none_at = nfc_polling ? nfc_win_end : 0;
+		(void)settings_delete("jc/amiibo");
+		amiibo_print();
+		return;
+	}
+	if (!strcmp(a, "hold") || !strcmp(a, "lift")) {
+		uint8_t v = !strcmp(a, "hold");
+
+		amiibo_held = v;
+		settings_save_one("jc/amiiboauto", &v, sizeof(v));
+		if (v) {
+			amiibo_now();
+		} else {
+			amiibo_off();
+		}
+		amiibo_print();
+		return;
+	}
+	if (!strcmp(a, "dump")) {
+		if (!amiibo_have) {
+			amiibo_print();
+			return;
+		}
+		memcpy(amiibo_snap, amiibo, AMIIBO_LEN);
+		amiibo_dump_sum = 2166136261U;
+		amiibo_dump_off = 0;
+		k_work_reschedule(&amiibo_dump_work, K_NO_WAIT);
+		return;
+	}
+	if (!strcmp(a, "tap")) {
+		if (!amiibo_have) {
+			printk("[AMIIBO] tap: nothing loaded\n");
+			return;
+		}
+		nfc_tap = true;
+		nfc_lifted = false;
+		amiibo_now();
+		printk("[AMIIBO] tap: %s\n", nfc_polling ? "on now" : "at the next scan");
+	}
+}
+#endif
+
 static ssize_t wr_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 		      const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -2129,6 +2721,128 @@ static ssize_t wr_cmd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 		const uint8_t *f = d + CMD_PREFIX;
 		const uint8_t cmd = f[0], sub = f[3];
 		uint8_t rsp[48];
+
+#if !defined(JC_LEFT)
+		if (cmd == 0x01 && (sub == 0x03 || sub == 0x04)) {
+			if (sub == 0x03) {
+				uint16_t win = (len >= CMD_PREFIX + 11) ?
+					       (uint16_t)(f[9] | (f[10] << 8)) : 0;
+				bool on = amiibo_have && !nfc_lifted &&
+					  (amiibo_held || nfc_tap ||
+					   amiibo_key_on);
+
+				nfc_state = 0;
+				nfc_polling = true;
+				nfc_empty = !on;
+				nfc_status = on ? 0x09 : 0x01;
+				nfc_win_end = win ? k_uptime_get() + win : 0;
+				nfc_none_at = on ? 0 : nfc_win_end;
+				nfc_tag_at = on ? k_uptime_get() + NFC_TAG_MS : 0;
+			} else {
+				nfc_polling = false;
+				nfc_none_at = 0;
+				if (nfc_tag_at) {
+					nfc_tag_at = 0;
+					nfc_empty = true;
+				}
+				if (nfc_empty) {
+					nfc_status = 0x00;
+				}
+			}
+			send_response(cmd, sub, NULL, 0);
+			return len;
+		}
+		if (cmd == 0x01 && sub == 0x05) {
+			static uint8_t info[61];
+
+			memset(info, 0, sizeof(info));
+			info[0] = nfc_status;
+			if (nfc_empty || !amiibo_have) {
+				info[1] = (nfc_status == 0x07) ? 0x41 : 0x00;
+			} else {
+				info[4] = 0x01;
+				info[5] = 0x01;
+				info[6] = 0x02;
+				info[8] = 0x07;
+				amiibo_uid(info + 9);
+			}
+			send_response(cmd, sub, info, sizeof(info));
+			return len;
+		}
+		if (cmd == 0x01 && sub == 0x06 && amiibo_have) {
+			nfc_build(f + 8, (uint16_t)(len - CMD_PREFIX - 8));
+			nfc_tag_at = 0;
+			nfc_read_at = k_uptime_get() + NFC_READ_MS;
+			send_response(cmd, sub, NULL, 0);
+			return len;
+		}
+		if (cmd == 0x01 && sub == 0x14 && amiibo_have) {
+			uint16_t off = 0, n = 0;
+			uint16_t have = (uint16_t)(len - CMD_PREFIX - 8);
+
+			if (have >= 4) {
+				off = (uint16_t)(f[8] | (f[9] << 8));
+				n = (uint16_t)(f[10] | (f[11] << 8));
+				n = (n > have - 4) ? (uint16_t)(have - 4) : n;
+			}
+			if (off == 0) {
+				nfc_wlen = 0;
+			}
+			if (off + n <= NFC_WRITE_MAX) {
+				memcpy(nfc_wbuf + off, f + 12, n);
+				if (off + n > nfc_wlen) {
+					nfc_wlen = off + n;
+				}
+			}
+			nfc_status = 0x03;
+			rsp[0] = 0x00;
+			send_response(cmd, sub, rsp, 1);
+			return len;
+		}
+		if (cmd == 0x01 && sub == 0x08 && amiibo_have) {
+			const char *why = nfc_write();
+
+			if (why) {
+				printk("[AMIIBO] write refused: %s\n", why);
+			} else {
+				nfc_tag_at = 0;
+				nfc_write_at = k_uptime_get() + NFC_WRITE_MS;
+				k_work_submit(&amiibo_save_work);
+				printk("[AMIIBO] written id=%02X%02X%02X%02X%02X%02X%02X%02X n=%u\n",
+				       amiibo[84], amiibo[85], amiibo[86], amiibo[87],
+				       amiibo[88], amiibo[89], amiibo[90], amiibo[91],
+				       (unsigned)((amiibo[17] << 8) | amiibo[18]));
+			}
+			rsp[0] = 0x00;
+			send_response(cmd, sub, rsp, 1);
+			return len;
+		}
+		if (cmd == 0x01 && sub == 0x15 && amiibo_have) {
+			static uint8_t piece[3 + NFC_PIECE_MAX];
+			uint16_t off = 0, n = 0;
+
+			if (len >= CMD_PREFIX + 10) {
+				off = (uint16_t)(f[8] | (f[9] << 8));
+			}
+			if (off < nfc_result_len) {
+				n = nfc_result_len - off;
+				n = (n > NFC_PIECE_MAX) ? NFC_PIECE_MAX : n;
+			}
+			memset(piece, 0, sizeof(piece));
+			piece[0] = (off + n >= nfc_result_len) ? 0x01 : 0x00;
+			piece[1] = (uint8_t)(n & 0xFF);
+			piece[2] = (uint8_t)(n >> 8);
+			if (n) {
+				memcpy(piece + 3, nfc_result + off, n);
+			}
+			if (piece[0]) {
+				nfc_tap = false;
+				nfc_reads++;
+			}
+			send_response(cmd, sub, piece, sizeof(piece));
+			return len;
+		}
+#endif
 
 		const uint8_t *payload = f + 8;
 
@@ -3226,8 +3940,61 @@ static void ptr_dump(void)
 }
 
 #if defined(JC_LEFT)
+
+static int8_t socd_last[2][2];
+
+static void socd_take(const uint8_t old[6], const uint8_t keys[6])
+{
+	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+
+	for (int i = 0; i < 6; i++) {
+		bool was = false;
+
+		if (!keys[i]) {
+			continue;
+		}
+		for (int o = 0; o < 6 && !was; o++) {
+			was = old[o] == keys[i];
+		}
+		for (uint8_t j = 0; !was && j < nb; j++) {
+			uint8_t kind = CFG.btn[j].kind;
+			int8_t dx = (int8_t)(CFG.btn[j].mask & 0xFF);
+			int8_t dy = (int8_t)(CFG.btn[j].mask >> 8);
+			int s = (kind == JC_BTN_PSTICK) ? 1 : 0;
+
+			if (CFG.btn[j].code != keys[i] ||
+			    (kind != JC_BTN_STICK && kind != JC_BTN_PSTICK)) {
+				continue;
+			}
+			if (dx) {
+				socd_last[s][0] = (dx < 0) ? -1 : 1;
+			}
+			if (dy) {
+				socd_last[s][1] = (dy < 0) ? -1 : 1;
+			}
+		}
+	}
+}
+
+static uint8_t socd_dirs(uint8_t v, int s)
+{
+	if ((v & (LINK_AUX_LEFT | LINK_AUX_RIGHT)) ==
+	    (LINK_AUX_LEFT | LINK_AUX_RIGHT)) {
+		v &= (uint8_t)~(LINK_AUX_LEFT | LINK_AUX_RIGHT);
+		v |= (socd_last[s][0] < 0) ? LINK_AUX_LEFT :
+		     (socd_last[s][0] > 0) ? LINK_AUX_RIGHT : 0;
+	}
+	if ((v & (LINK_AUX_UP | LINK_AUX_DOWN)) == (LINK_AUX_UP | LINK_AUX_DOWN)) {
+		v &= (uint8_t)~(LINK_AUX_UP | LINK_AUX_DOWN);
+		v |= (socd_last[s][1] > 0) ? LINK_AUX_UP :
+		     (socd_last[s][1] < 0) ? LINK_AUX_DOWN : 0;
+	}
+	return v;
+}
+
 static void kbd_apply(uint8_t mods, const uint8_t keys[6])
 {
+	socd_take(kbd_keys, keys);
 	kbd_mods = mods;
 	for (int i = 0; i < 6; i++) {
 		kbd_keys[i] = keys[i];
@@ -3293,6 +4060,10 @@ static void kbd_from(uint8_t src, uint8_t mods, const uint8_t keys[6])
 	hm_kbd_merge(kb_from, 2, &m, k);
 	kbd_apply(m, k);
 	k_sched_unlock();
+	k_sem_give(&link_wake);
+	if (jc_live()) {
+		rpt_soon();
+	}
 }
 
 static int64_t lmouse_used_until;
@@ -3326,6 +4097,8 @@ static void lmouse_apply(uint8_t have, int16_t x, int16_t y, int8_t wheel,
 		wheel_btn_feed(wheel);
 		if (wheel) {
 			lmouse_used_until = k_uptime_get() + 200;
+			k_sem_give(&link_wake);
+			rpt_soon();
 		}
 	}
 	if ((have & HM_XY) && (x || y)) {
@@ -3335,9 +4108,15 @@ static void lmouse_apply(uint8_t have, int16_t x, int16_t y, int8_t wheel,
 		user_input_seen();
 	}
 	if (have & HM_BTN) {
+		bool changed = btn != mouse_buttons;
+
 		mouse_buttons = btn;
 		if (btn) {
 			user_input_seen();
+		}
+		if (changed) {
+			k_sem_give(&link_wake);
+			rpt_soon();
 		}
 	}
 }
@@ -3529,6 +4308,9 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		mouse_dy += y;
 		mouse_wheel += wheel;
 		wheel_btn_feed(wheel);
+		if (wheel) {
+			rpt_soon();
+		}
 		if (x || y) {
 			rs_push(x, y);
 		}
@@ -3542,9 +4324,14 @@ static uint8_t mouse_notify(struct bt_conn *conn,
 		}
 
 		if (trust ? (have & HM_BTN) != 0 : rpt_handle != 0) {
+			bool changed = btn != mouse_buttons;
+
 			mouse_buttons = btn;
 			if (btn) {
 				user_input_seen();
+			}
+			if (changed) {
+				rpt_soon();
 			}
 		}
 	}
@@ -4305,9 +5092,16 @@ static void wired_mouse(long dx, long dy, long wheel, uint8_t btn)
 		mouse_has_moved = true;
 		user_input_seen();
 	}
-	mouse_buttons = btn;
-	if (btn) {
-		user_input_seen();
+	{
+		bool changed = btn != mouse_buttons;
+
+		mouse_buttons = btn;
+		if (btn) {
+			user_input_seen();
+		}
+		if (changed || w) {
+			rpt_soon();
+		}
 	}
 }
 #endif
@@ -4893,6 +5687,7 @@ static void aim_heard(uint32_t v)
 	aim_rx_ok = true;
 	aim_pend_n = 0;
 }
+
 #endif
 
 static uint32_t link_rx_p10;
@@ -5030,6 +5825,9 @@ static void link_isr(const struct device *dev, void *user_data)
 				link_aux_pend_n = 0;
 			} else if (v == link_aux_pend) {
 				if (++link_aux_pend_n >= 2) {
+					if ((v ^ peer_aux) & LINK_AUX_DIRS) {
+						rpt_soon();
+					}
 					peer_aux = v;
 					link_aux_pend_n = 0;
 				}
@@ -5053,6 +5851,7 @@ static void link_isr(const struct device *dev, void *user_data)
 				if (++link_pend_n >= 2) {
 					peer_buttons = v;
 					link_pend_n = 0;
+					rpt_soon();
 				}
 			} else {
 				link_pend = v;
@@ -5154,12 +5953,16 @@ static uint16_t link_tx_aux(void)
 {
 	uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
 	uint16_t a = 0;
+	uint8_t kd = 0;
 
 	if (hid_ready()) {
 		a |= LINK_AUX_DEV;
 	}
 	if (jc_typing()) {
 		a |= LINK_AUX_TYPING;
+	}
+	if (amiibo_key_down()) {
+		a |= LINK_AUX_AMIIBO;
 	}
 	if (kbd_mods) {
 		a |= LINK_AUX_ACT;
@@ -5186,18 +5989,19 @@ static uint16_t link_tx_aux(void)
 			dx = (int8_t)(CFG.btn[j].mask & 0xFF);
 			dy = (int8_t)(CFG.btn[j].mask >> 8);
 			if (dy > 0) {
-				a |= LINK_AUX_UP;
+				kd |= LINK_AUX_UP;
 			} else if (dy < 0) {
-				a |= LINK_AUX_DOWN;
+				kd |= LINK_AUX_DOWN;
 			}
 			if (dx < 0) {
-				a |= LINK_AUX_LEFT;
+				kd |= LINK_AUX_LEFT;
 			} else if (dx > 0) {
-				a |= LINK_AUX_RIGHT;
+				kd |= LINK_AUX_RIGHT;
 			}
 			break;
 		}
 	}
+	a |= socd_dirs(kd, 1);
 	return a;
 }
 
@@ -5393,6 +6197,7 @@ static void link_tx_aim(int64_t now)
 	last = v;
 	last_at = now;
 }
+
 #else
 static void link_rx_aim(void)
 {
@@ -5623,7 +6428,7 @@ static void link_thread(void *a, void *b, void *c)
 		    (k_uptime_get() - peer_last_rx) > LINK_STALE_MS) {
 			peer_buttons = 0;
 		}
-		if (peer_aux && peer_last_rx &&
+		if (peer_last_rx &&
 		    (k_uptime_get() - peer_last_rx) > LINK_STALE_MS) {
 			peer_aux = 0;
 		}
@@ -6069,6 +6874,21 @@ static void jm_apply(uint8_t *r, int32_t vx, int32_t vy)
 	}
 }
 
+static bool rest_now;
+static uint16_t rest_at;
+
+static void rest_pose(uint8_t *r)
+{
+	memcpy(r + ROT_PLAY_AT, ROT_PLAY[rest_at], ROT_PLAY_LEN);
+	if (++rest_at >= rot_blen) {
+		rest_at = 0;
+	}
+	jm_put(r, JM_ACC_A, 14, 0);
+	jm_put(r, JM_ACC_B, 13, 0);
+	jm_put(r, JM_ACC_C, 14, 0);
+	jm_apply(r, 0, 0);
+}
+
 static void rot_apply(uint8_t *r)
 {
 	memcpy(r + ROT_PLAY_AT, ROT_PLAY[rot_bidx], ROT_PLAY_LEN);
@@ -6188,7 +7008,8 @@ static void send_report(void)
 		idx = replay_lo;
 	}
 #if MOTION_HOLD
-	memcpy(r + 0x0E, REAL_REPORTS[MOTION_HOLD] + 0x0E, 0x37 - 0x0E);
+	BUILD_ASSERT(LEFT_HELD_LEN == 0x37 - 0x0E, "the held frame is the motion block and its length byte");
+	memcpy(r + 0x0E, LEFT_HELD, LEFT_HELD_LEN);
 #endif
 	r[0x00] = (uint8_t)report_seq++;
 
@@ -6233,11 +7054,13 @@ static void send_report(void)
 	}
 
 	{
-		int32_t sx = STICK_CX, sy = STICK_CY;
+		int32_t sx = LSTICK_CX, sy = LSTICK_CY;
 		const int32_t up = STICK_Y_UP_POSITIVE ? STICK_THROW : -STICK_THROW;
 		uint32_t packed;
 
 		uint8_t nb = CFG.n_btn > JC_CFG_BTNS ? JC_CFG_BTNS : CFG.n_btn;
+		int32_t kx = 0, ky = 0;
+		bool xn = false, xp = false, yn = false, yp = false;
 
 		for (uint8_t j = 0; jc_live() && j < nb; j++) {
 			uint16_t packed;
@@ -6250,12 +7073,27 @@ static void send_report(void)
 			packed = CFG.btn[j].mask;
 			for (int i = 0; i < 6; i++) {
 				if (kbd_keys[i] && kbd_keys[i] == code) {
-					sx += (int8_t)(packed & 0xFF) * STICK_THROW;
-					sy += (int8_t)(packed >> 8) * up;
+					int8_t dx = (int8_t)(packed & 0xFF);
+					int8_t dy = (int8_t)(packed >> 8);
+
+					kx += dx * STICK_THROW;
+					ky += dy * up;
+					xn = xn || dx < 0;
+					xp = xp || dx > 0;
+					yn = yn || dy < 0;
+					yp = yp || dy > 0;
 					break;
 				}
 			}
 		}
+		if (xn && xp) {
+			kx = socd_last[0][0] * STICK_THROW;
+		}
+		if (yn && yp) {
+			ky = socd_last[0][1] * up;
+		}
+		sx += kx;
+		sy += ky;
 		for (uint8_t j = 0; j < nb; j++) {
 			if (CFG.btn[j].kind != JC_BTN_MSTICK ||
 			    !(mouse_buttons & CFG.btn[j].code)) {
@@ -6306,17 +7144,17 @@ static void send_report(void)
 		if (lmouse_aims()) {
 			wx = 0;
 			wy = 0;
-			mg_rem_x = 0;
-			mg_rem_y = 0;
+			flow_drop();
 		} else {
-			mouse_gain_apply(&wx, &wy);
+			flow_emit(&wx, &wy);
 		}
+		ptr_moved(dx_all, dy_all);
 		r[0x09] = wx & 0xFF;
 		r[0x0A] = (wx >> 8) & 0xFF;
 		r[0x0B] = wy & 0xFF;
 		r[0x0C] = (wy >> 8) & 0xFF;
 		if (mouse_has_moved && since >= MOUSE_AIRBORNE_MS &&
-		    !lmouse_aims()) {
+		    !lmouse_aims() && !ptr_resting()) {
 			static uint8_t desk_at;
 
 			memcpy(r + 0x0E, LEFT_DESK[desk_at], LEFT_DESK_LEN);
@@ -6389,8 +7227,8 @@ static void send_report(void)
 			sx = STICK_MCX + ox;
 			sy = STICK_MCY + oy;
 		} else {
-			sx = STICK_CX + stick_x;
-			sy = STICK_CY + stick_y;
+			sx = STICK_MCX + stick_x;
+			sy = STICK_MCY + stick_y;
 		}
 		{
 			int8_t hx, hy;
@@ -6439,10 +7277,14 @@ static void send_report(void)
 				wy = 0;
 			}
 			if (ptr_off()) {
-				mg_rem_x = 0;
-				mg_rem_y = 0;
+				flow_drop();
 			} else {
-				mouse_gain_apply(&wx, &wy);
+				flow_emit(&wx, &wy);
+			}
+			if (ptr_off()) {
+				ptr_wake_sum = 0;
+			} else {
+				ptr_moved(dx_all, dy_all);
 			}
 			r[0x09] = wx & 0xFF;
 			r[0x0A] = (wx >> 8) & 0xFF;
@@ -6456,10 +7298,17 @@ static void send_report(void)
 
 	sweep_apply(r);
 
+	if (ptr_resting()) {
+		r[0x0D] = 0xFF;
+	}
+	rest_now = false;
 	if (rot_test) {
 		rot_apply(r);
+	} else if (r[0x0D] == 0xFF) {
+		rest_pose(r);
+		rest_now = true;
 	}
-	if (!rot_test) {
+	if (!rot_test && !rest_now) {
 		uint32_t now = k_uptime_get_32();
 		uint32_t dms = now - jm_ms;
 
@@ -6468,6 +7317,31 @@ static void send_report(void)
 		jm_put(r, 0, 12, now & 0xFFFU);
 		jm_put(r, 12, 12, dms);
 	}
+	amiibo_key_tick();
+	if (nfc_tag_at && k_uptime_get() >= nfc_tag_at) {
+		nfc_tag_at = 0;
+		nfc_state = 0x01;
+		nfc_status = 0x09;
+		nfc_empty = false;
+	}
+	if (nfc_read_at && k_uptime_get() >= nfc_read_at) {
+		nfc_read_at = 0;
+		nfc_state = 0x02;
+		nfc_status = 0x04;
+	}
+	if (nfc_write_at && k_uptime_get() >= nfc_write_at) {
+		nfc_write_at = 0;
+		nfc_state = 0x03;
+		nfc_status = 0x05;
+		nfc_lifted = !(amiibo_held || amiibo_key_on);
+	}
+	if (nfc_none_at && k_uptime_get() >= nfc_none_at) {
+		nfc_none_at = 0;
+		nfc_state = 0x01;
+		nfc_status = 0x07;
+		nfc_lifted = false;
+	}
+	r[0x0E] = nfc_state;
 #endif
 
 	{
@@ -6483,6 +7357,8 @@ static void send_report(void)
 		err = bt_gatt_notify_cb(g_conn, &np);
 		if (err) {
 			atomic_dec(&rpt_inflight);
+		} else {
+			reports_sent++;
 		}
 	}
 }
@@ -6681,6 +7557,8 @@ static void dump_map(void)
 	printk("[MAP] side=R tag=" BUILD_TAG "\n");
 	printk("[MAP] sens %d\n", stick_mgain);
 	printk("[MAP] msens %u\n", mouse_gain);
+	printk("[MAP] maccelx %u %d %d\n", accel_lo, (int)accel_slow,
+	       (int)accel_fast);
 	printk("[MAP] stickdz %d\n", stick_dz);
 	printk("[MAP] stickvg %d\n", stick_vgain);
 	printk("[MAP] gyrogain %d\n", jm_gain);
@@ -6702,9 +7580,34 @@ static void dump_map(void)
 	printk("[MAP] end\n");
 }
 
+static void rpt_wait(int64_t *due, int64_t last)
+{
+	int64_t gap = link_us ? (int64_t)((link_us + 999U) / 1000U) : report_ms;
+
+	for (;;) {
+		int64_t now = k_uptime_get();
+
+		if (now >= *due) {
+			return;
+		}
+		if (k_sem_take(&rpt_kick, K_TIMEOUT_ABS_MS(*due)) != 0) {
+			return;
+		}
+		now = k_uptime_get();
+		if (now >= last + gap) {
+			*due = now;
+			return;
+		}
+		if (last + gap < *due) {
+			*due = last + gap;
+		}
+	}
+}
+
 static void report_thread(void *a, void *b, void *c)
 {
 	int64_t due = k_uptime_get();
+	int64_t last = 0;
 
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	while (1) {
@@ -6718,7 +7621,14 @@ static void report_thread(void *a, void *b, void *c)
 		gyro_auto_track();
 		wake_tick();
 #endif
-		send_report();
+		{
+			uint32_t n0 = reports_sent;
+
+			send_report();
+			if (reports_sent != n0) {
+				last = k_uptime_get();
+			}
+		}
 
 		due += report_ms;
 		{
@@ -6727,7 +7637,7 @@ static void report_thread(void *a, void *b, void *c)
 			if (due <= now) {
 				due = now + report_ms;
 			}
-			k_sleep(K_TIMEOUT_ABS_MS(due));
+			rpt_wait(&due, last);
 		}
 	}
 }
