@@ -21,6 +21,8 @@ consumer friendly version that is in development and is ran on this same firmwar
 - [License](#license)
 
 ## Features
+- **Amiibo's:** Amiibo's are supported by being loaded in the Web-Tool. (Amiibo's are not included import them yourself.)
+- **Amiibo Tag ID:** you can randomize the tag ID of a amiibo so you can bypass daily limits on some games (e.g, Zelda BOTW)
 - **Battery:** The firmware reads the BT devices battery health for the console to understand.
 - **Remapping:** Map any key or mouse button to any Joy-Con button.
 - **Input stacking:** You can stack 2 inputs on 1 button (e.g, Right Click + J = Y button) if you wanted to use both inputs the same.
@@ -47,13 +49,14 @@ consumer friendly version that is in development and is ran on this same firmwar
 This firmware could be built upon to work with any gaming controller, Xbox, PlayStation, older Nintendo controllers, Turtle Beach, Steam controller, Flydigi, Arcade Controllers etc. Whatever gaming controller or device you use it most likely can be implemented to work on the Nintendo Switch 2.
 
 
-## Bugs
+## Notes on issues
 
 - **Wired Devices:** In the Web-Tool Wired support works decent but is more vulnerable to slip ups sending input to the PC and the console at the same time when it should only send its input to the console, the [Wired app](https://github.com/desktopsetup/XD2Joy-Webtool/releases/tag/v1.0) helps prevent these issues.
 - **Bluetooth Classic:** Bluetooth Classic/Bluetooth 3.0 devices are not compatible and is a bug that can not be fixed since it is not Bluetooth Low Energy (BLE). 
 - **Connecting:** Sometimes when you do a fresh disconnect or new pair to the console only 1 of the Bluetooth devices pair and it takes backing out a couple times for it to recognize the other one.
 - **Snapping on slow mouse movement:** slow movements can snap visually, in both Mouse Mode and Thumbstick Mode. The Thumbstick Mode has a setting in the Web-Tool that helps.
 - **Misread inputs in games:** Certain conditions from the keyboard/mouse or the game receives inputs that never are actually sent to the console but show up in game and not outside of it.
+- **Motion Controls:** some games will turn or be locked in a certain camera POV this is because the "Joy-Cons" send motion data this will mess up some people in games so depending on how you're playing the game turning it off will fix this issue.
 - **Pairing notification:** pairing notification might be off or consistent.
 - **Bad Delay for some situations:** Most input delays are fixed but delay can still happen (e.g, pairing too many Joy-Cons or turning the console on and off and reconnecting.) was an issue and other situations like this could also trigger a bad delay but repairing always fixes it. 
 - **Connection status on BT devices:** A keyboard or mouse with a LED status for being connected to something wont get trigged being connected to the switch 2 but still functions.
